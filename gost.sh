@@ -1,5 +1,5 @@
 #!/bin/bash
-# GOST 增强版管理脚本 v2.4.0 - 流量统计与到期管理
+# GOST 增强版管理脚本 v2.5.0 - 双向流量实时统计
 # 一键安装: bash <(curl -sSL https://raw.githubusercontent.com/xmg0828-01/gost/main/gost.sh)
 # 快捷使用: g
 
@@ -8,7 +8,7 @@ Blue_font_prefix="\033[34m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
 Warning="${Yellow_font_prefix}[警告]${Font_color_suffix}"
-shell_version="2.4.0"
+shell_version="2.5.0"
 ct_new_ver="2.11.5"
 
 gost_conf_path="/etc/gost/config.json"
@@ -87,7 +87,7 @@ EOF
     create_traffic_monitor_script
     
     echo "0 * * * * root /usr/local/bin/gost-expire-check.sh >/dev/null 2>&1" > /etc/cron.d/gost-expire
-    echo "*/5 * * * * root /usr/local/bin/gost-traffic-monitor.sh >/dev/null 2>&1" >> /etc/cron.d/gost-expire
+    echo "* * * * * root /usr/local/bin/gost-traffic-monitor.sh >/dev/null 2>&1" >> /etc/cron.d/gost-expire
     echo "0 0 * * * root /usr/local/bin/gost-traffic-reset.sh daily >/dev/null 2>&1" >> /etc/cron.d/gost-expire
     echo "0 0 1 * * root /usr/local/bin/gost-traffic-reset.sh monthly >/dev/null 2>&1" >> /etc/cron.d/gost-expire
     
@@ -119,10 +119,15 @@ if [ "$need_rebuild" = true ]; then
         sed -i "/\/${port}#/d" "$RAW_CONF"
         sed -i "/^${port}:/d" "$EXPIRES_FILE"
         sed -i "/^${port}:/d" "/etc/gost/remarks.txt"
-        iptables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
-        iptables -D INPUT -p udp --dport $port -j ACCEPT 2>/dev/null
-        iptables -t mangle -F GOST_$port 2>/dev/null
-        iptables -t mangle -X GOST_$port 2>/dev/null
+        # 清理双向iptables规则
+        iptables -t mangle -D PREROUTING -p tcp --dport $port -j GOST_IN_$port 2>/dev/null
+        iptables -t mangle -D PREROUTING -p udp --dport $port -j GOST_IN_$port 2>/dev/null
+        iptables -t mangle -D POSTROUTING -p tcp --sport $port -j GOST_OUT_$port 2>/dev/null
+        iptables -t mangle -D POSTROUTING -p udp --sport $port -j GOST_OUT_$port 2>/dev/null
+        iptables -t mangle -F GOST_IN_$port 2>/dev/null
+        iptables -t mangle -X GOST_IN_$port 2>/dev/null
+        iptables -t mangle -F GOST_OUT_$port 2>/dev/null
+        iptables -t mangle -X GOST_OUT_$port 2>/dev/null
         echo "[$(date)] 端口 $port 的转发规则已过期并删除" >> /var/log/gost.log
     done
     
@@ -176,17 +181,28 @@ month=$(date +%Y%m)
 while IFS= read -r line; do
     port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
     
-    tcp_bytes=$(iptables -t mangle -nvxL GOST_$port 2>/dev/null | awk '/ACCEPT/{sum+=$2}END{print sum+0}')
-    udp_bytes=$(iptables -t mangle -nvxL GOST_$port 2>/dev/null | awk '/ACCEPT.*udp/{sum+=$2}END{print sum+0}')
-    total_bytes=$((tcp_bytes + udp_bytes))
+    # 获取入站流量
+    in_tcp=$(iptables -t mangle -nvxL GOST_IN_$port 2>/dev/null | awk '/ACCEPT.*tcp/{sum+=$2}END{print sum+0}')
+    in_udp=$(iptables -t mangle -nvxL GOST_IN_$port 2>/dev/null | awk '/ACCEPT.*udp/{sum+=$2}END{print sum+0}')
+    in_bytes=$((in_tcp + in_udp))
+    
+    # 获取出站流量
+    out_tcp=$(iptables -t mangle -nvxL GOST_OUT_$port 2>/dev/null | awk '/ACCEPT.*tcp/{sum+=$2}END{print sum+0}')
+    out_udp=$(iptables -t mangle -nvxL GOST_OUT_$port 2>/dev/null | awk '/ACCEPT.*udp/{sum+=$2}END{print sum+0}')
+    out_bytes=$((out_tcp + out_udp))
+    
+    # 总流量
+    total_bytes=$((in_bytes + out_bytes))
     
     old_data=$(grep "^$port:" "$TRAFFIC_DB" 2>/dev/null)
     if [ -n "$old_data" ]; then
         old_total=$(echo "$old_data" | cut -d: -f2)
-        old_today=$(echo "$old_data" | cut -d: -f3)
-        old_month=$(echo "$old_data" | cut -d: -f4)
-        old_date=$(echo "$old_data" | cut -d: -f5)
-        old_month_date=$(echo "$old_data" | cut -d: -f6)
+        old_in=$(echo "$old_data" | cut -d: -f3)
+        old_out=$(echo "$old_data" | cut -d: -f4)
+        old_today=$(echo "$old_data" | cut -d: -f5)
+        old_month=$(echo "$old_data" | cut -d: -f6)
+        old_date=$(echo "$old_data" | cut -d: -f7)
+        old_month_date=$(echo "$old_data" | cut -d: -f8)
         
         if [ "$old_date" != "$today" ]; then
             old_today=0
@@ -196,6 +212,7 @@ while IFS= read -r line; do
             old_month=0
         fi
         
+        # 计算增量
         if [ "$total_bytes" -ge "$old_total" ]; then
             increment=$((total_bytes - old_total))
         else
@@ -206,9 +223,9 @@ while IFS= read -r line; do
         new_month=$((old_month + increment))
         
         sed -i "/^$port:/d" "$TRAFFIC_DB"
-        echo "$port:$total_bytes:$new_today:$new_month:$today:$month:$current_time" >> "$TRAFFIC_DB"
+        echo "$port:$total_bytes:$in_bytes:$out_bytes:$new_today:$new_month:$today:$month:$current_time" >> "$TRAFFIC_DB"
     else
-        echo "$port:$total_bytes:$total_bytes:$total_bytes:$today:$month:$current_time" >> "$TRAFFIC_DB"
+        echo "$port:$total_bytes:$in_bytes:$out_bytes:$total_bytes:$total_bytes:$today:$month:$current_time" >> "$TRAFFIC_DB"
     fi
 done < "$RAW_CONF"
 
@@ -223,13 +240,13 @@ TRAFFIC_DB="/etc/gost/traffic.db"
 reset_type="$1"
 
 if [ "$reset_type" = "daily" ]; then
-    while IFS=: read -r port total today month date month_date time; do
-        echo "$port:$total:0:$month:$(date +%Y%m%d):$month_date:$time"
+    while IFS=: read -r port total in out today month date month_date time; do
+        echo "$port:$total:$in:$out:0:$month:$(date +%Y%m%d):$month_date:$time"
     done < "$TRAFFIC_DB" > "$TRAFFIC_DB.tmp"
     mv "$TRAFFIC_DB.tmp" "$TRAFFIC_DB"
 elif [ "$reset_type" = "monthly" ]; then
-    while IFS=: read -r port total today month date month_date time; do
-        echo "$port:$total:$today:0:$date:$(date +%Y%m):$time"
+    while IFS=: read -r port total in out today month date month_date time; do
+        echo "$port:$total:$in:$out:$today:0:$date:$(date +%Y%m):$time"
     done < "$TRAFFIC_DB" > "$TRAFFIC_DB.tmp"
     mv "$TRAFFIC_DB.tmp" "$TRAFFIC_DB"
 fi
@@ -239,21 +256,40 @@ RESET_EOF
 
 setup_iptables_for_port() {
     local port=$1
-    iptables -t mangle -N GOST_$port 2>/dev/null
-    iptables -t mangle -C PREROUTING -p tcp --dport $port -j GOST_$port 2>/dev/null || \
-        iptables -t mangle -A PREROUTING -p tcp --dport $port -j GOST_$port
-    iptables -t mangle -C PREROUTING -p udp --dport $port -j GOST_$port 2>/dev/null || \
-        iptables -t mangle -A PREROUTING -p udp --dport $port -j GOST_$port
-    iptables -t mangle -C GOST_$port -j ACCEPT 2>/dev/null || \
-        iptables -t mangle -A GOST_$port -j ACCEPT
+    
+    # 创建入站流量统计链
+    iptables -t mangle -N GOST_IN_$port 2>/dev/null
+    iptables -t mangle -C PREROUTING -p tcp --dport $port -j GOST_IN_$port 2>/dev/null || \
+        iptables -t mangle -A PREROUTING -p tcp --dport $port -j GOST_IN_$port
+    iptables -t mangle -C PREROUTING -p udp --dport $port -j GOST_IN_$port 2>/dev/null || \
+        iptables -t mangle -A PREROUTING -p udp --dport $port -j GOST_IN_$port
+    iptables -t mangle -C GOST_IN_$port -j ACCEPT 2>/dev/null || \
+        iptables -t mangle -A GOST_IN_$port -j ACCEPT
+    
+    # 创建出站流量统计链
+    iptables -t mangle -N GOST_OUT_$port 2>/dev/null
+    iptables -t mangle -C POSTROUTING -p tcp --sport $port -j GOST_OUT_$port 2>/dev/null || \
+        iptables -t mangle -A POSTROUTING -p tcp --sport $port -j GOST_OUT_$port
+    iptables -t mangle -C POSTROUTING -p udp --sport $port -j GOST_OUT_$port 2>/dev/null || \
+        iptables -t mangle -A POSTROUTING -p udp --sport $port -j GOST_OUT_$port
+    iptables -t mangle -C GOST_OUT_$port -j ACCEPT 2>/dev/null || \
+        iptables -t mangle -A GOST_OUT_$port -j ACCEPT
 }
 
 remove_iptables_for_port() {
     local port=$1
-    iptables -t mangle -D PREROUTING -p tcp --dport $port -j GOST_$port 2>/dev/null
-    iptables -t mangle -D PREROUTING -p udp --dport $port -j GOST_$port 2>/dev/null
-    iptables -t mangle -F GOST_$port 2>/dev/null
-    iptables -t mangle -X GOST_$port 2>/dev/null
+    
+    # 删除入站规则
+    iptables -t mangle -D PREROUTING -p tcp --dport $port -j GOST_IN_$port 2>/dev/null
+    iptables -t mangle -D PREROUTING -p udp --dport $port -j GOST_IN_$port 2>/dev/null
+    iptables -t mangle -F GOST_IN_$port 2>/dev/null
+    iptables -t mangle -X GOST_IN_$port 2>/dev/null
+    
+    # 删除出站规则
+    iptables -t mangle -D POSTROUTING -p tcp --sport $port -j GOST_OUT_$port 2>/dev/null
+    iptables -t mangle -D POSTROUTING -p udp --sport $port -j GOST_OUT_$port 2>/dev/null
+    iptables -t mangle -F GOST_OUT_$port 2>/dev/null
+    iptables -t mangle -X GOST_OUT_$port 2>/dev/null
 }
 
 format_bytes() {
@@ -261,12 +297,48 @@ format_bytes() {
     if [ "$bytes" -lt 1024 ]; then
         echo "${bytes}B"
     elif [ "$bytes" -lt 1048576 ]; then
-        echo "$(echo "scale=2; $bytes/1024" | bc)KB"
+        echo "$(printf "%.2f" $(echo "scale=2; $bytes/1024" | bc))KB"
     elif [ "$bytes" -lt 1073741824 ]; then
-        echo "$(echo "scale=2; $bytes/1048576" | bc)MB"
+        echo "$(printf "%.2f" $(echo "scale=2; $bytes/1048576" | bc))MB"
     else
-        echo "$(echo "scale=2; $bytes/1073741824" | bc)GB"
+        echo "$(printf "%.2f" $(echo "scale=2; $bytes/1073741824" | bc))GB"
     fi
+}
+
+get_realtime_traffic() {
+    local port=$1
+    
+    # 获取实时流量数据
+    local in_tcp=$(iptables -t mangle -nvxL GOST_IN_$port 2>/dev/null | awk '/ACCEPT.*tcp/{sum+=$2}END{print sum+0}')
+    local in_udp=$(iptables -t mangle -nvxL GOST_IN_$port 2>/dev/null | awk '/ACCEPT.*udp/{sum+=$2}END{print sum+0}')
+    local out_tcp=$(iptables -t mangle -nvxL GOST_OUT_$port 2>/dev/null | awk '/ACCEPT.*tcp/{sum+=$2}END{print sum+0}')
+    local out_udp=$(iptables -t mangle -nvxL GOST_OUT_$port 2>/dev/null | awk '/ACCEPT.*udp/{sum+=$2}END{print sum+0}')
+    
+    local in_bytes=$((in_tcp + in_udp))
+    local out_bytes=$((out_tcp + out_udp))
+    local total_bytes=$((in_bytes + out_bytes))
+    
+    # 获取历史数据计算速率
+    local traffic_data=$(grep "^$port:" "$traffic_path" 2>/dev/null)
+    local speed_in=0
+    local speed_out=0
+    
+    if [ -n "$traffic_data" ]; then
+        local old_in=$(echo "$traffic_data" | cut -d: -f3)
+        local old_out=$(echo "$traffic_data" | cut -d: -f4)
+        local old_time=$(echo "$traffic_data" | cut -d: -f9)
+        local current_time=$(date +%s)
+        local time_diff=$((current_time - old_time))
+        
+        if [ "$time_diff" -gt 0 ] && [ "$time_diff" -lt 120 ]; then
+            speed_in=$(( (in_bytes - old_in) / time_diff ))
+            speed_out=$(( (out_bytes - old_out) / time_diff ))
+            [ "$speed_in" -lt 0 ] && speed_in=0
+            [ "$speed_out" -lt 0 ] && speed_out=0
+        fi
+    fi
+    
+    echo "$in_bytes:$out_bytes:$total_bytes:$speed_in:$speed_out"
 }
 
 get_port_traffic() {
@@ -274,25 +346,11 @@ get_port_traffic() {
     local traffic_data=$(grep "^$port:" "$traffic_path" 2>/dev/null)
     
     if [ -n "$traffic_data" ]; then
-        local today=$(echo "$traffic_data" | cut -d: -f3)
-        local month=$(echo "$traffic_data" | cut -d: -f4)
-        local last_update=$(echo "$traffic_data" | cut -d: -f7)
-        
-        local current_time=$(date +%s)
-        local time_diff=$((current_time - last_update))
-        if [ "$time_diff" -gt 0 ] && [ "$time_diff" -lt 600 ]; then
-            local current_bytes=$(iptables -t mangle -nvxL GOST_$port 2>/dev/null | awk '/ACCEPT/{sum+=$2}END{print sum+0}')
-            local old_bytes=$(echo "$traffic_data" | cut -d: -f2)
-            local bytes_diff=$((current_bytes - old_bytes))
-            if [ "$bytes_diff" -lt 0 ]; then bytes_diff=0; fi
-            local speed=$((bytes_diff / time_diff))
-        else
-            local speed=0
-        fi
-        
-        echo "$today:$month:$speed"
+        local today=$(echo "$traffic_data" | cut -d: -f5)
+        local month=$(echo "$traffic_data" | cut -d: -f6)
+        echo "$today:$month"
     else
-        echo "0:0:0"
+        echo "0:0"
     fi
 }
 
@@ -336,7 +394,7 @@ show_header() {
     echo -e "${Blue_font_prefix}======================================================${Font_color_suffix}"
     echo -e "${Green_font_prefix}          GOST 增强版管理面板 v${shell_version}${Font_color_suffix}"
     echo -e "${Blue_font_prefix}======================================================${Font_color_suffix}"
-    echo -e "${Yellow_font_prefix}功能: 转发管理 | 到期时间 | 流量统计 | 备注信息${Font_color_suffix}"
+    echo -e "${Yellow_font_prefix}功能: 双向流量统计 | 实时更新 | 到期管理${Font_color_suffix}"
     echo -e "${Blue_font_prefix}======================================================${Font_color_suffix}"
     echo
 }
@@ -388,6 +446,9 @@ get_system_info() {
     active_rules=$(wc -l < "$raw_conf_path" 2>/dev/null || echo "0")
     expired_rules=$(check_expired_rules)
     
+    # 更新流量数据
+    /usr/local/bin/gost-traffic-monitor.sh 2>/dev/null
+    
     total_traffic=0
     if [ -f "$traffic_path" ]; then
         while IFS=: read -r port total rest; do
@@ -401,16 +462,19 @@ get_system_info() {
 }
 
 show_forwards_list() {
-    echo -e "${Blue_font_prefix}================================ 转发规则列表 ================================${Font_color_suffix}"
+    # 实时更新流量数据
+    /usr/local/bin/gost-traffic-monitor.sh 2>/dev/null
+    
+    echo -e "${Blue_font_prefix}====================================== 转发规则列表 ======================================${Font_color_suffix}"
     if [ ! -f "$raw_conf_path" ] || [ ! -s "$raw_conf_path" ]; then
         echo -e "${Warning} 暂无转发规则"
         echo
         return
     fi
 
-    printf "${Green_font_prefix}%-4s %-8s %-20s %-10s %-12s %-10s${Font_color_suffix}\n" \
-        "ID" "端口" "目标地址" "备注" "到期时间" "今日流量"
-    echo -e "${Blue_font_prefix}------------------------------------------------------------------------------${Font_color_suffix}"
+    printf "${Green_font_prefix}%-4s %-8s %-20s %-10s %-12s %-18s${Font_color_suffix}\n" \
+        "ID" "端口" "目标地址" "备注" "到期时间" "流量(入/出)"
+    echo -e "${Blue_font_prefix}------------------------------------------------------------------------------------------${Font_color_suffix}"
     
     local id=1
     while IFS= read -r line; do
@@ -421,9 +485,11 @@ show_forwards_list() {
         local expire_info=$(grep "^${port}:" "$expires_path" 2>/dev/null | cut -d':' -f2- || echo "永久")
         local expire_display=$(format_expire_date "$expire_info")
         
-        local traffic_info=$(get_port_traffic "$port")
-        local today_traffic=$(echo "$traffic_info" | cut -d: -f1)
-        local today_display=$(format_bytes "$today_traffic")
+        # 获取实时流量
+        local realtime_data=$(get_realtime_traffic "$port")
+        local in_bytes=$(echo "$realtime_data" | cut -d: -f1)
+        local out_bytes=$(echo "$realtime_data" | cut -d: -f2)
+        local traffic_display="$(format_bytes $in_bytes)/$(format_bytes $out_bytes)"
         
         [ ${#remark} -gt 8 ] && remark="${remark:0:8}.."
         [ ${#target} -gt 12 ] && target_display="${target:0:10}.." || target_display="$target"
@@ -436,11 +502,161 @@ show_forwards_list() {
             expire_color=""
         fi
         
-        printf "%-4s %-8s %-20s %-10s ${expire_color}%-12s${Font_color_suffix} %-10s\n" \
-            "$id" "$port" "${target_display}:${target_port}" "$remark" "$expire_display" "$today_display"
+        printf "%-4s %-8s %-20s %-10s ${expire_color}%-12s${Font_color_suffix} %-18s\n" \
+            "$id" "$port" "${target_display}:${target_port}" "$remark" "$expire_display" "$traffic_display"
         
         ((id++))
     done < "$raw_conf_path"
+    echo
+}
+
+show_traffic_realtime() {
+    local refresh_interval=2
+    local show_details=true
+    
+    while true; do
+        clear
+        show_header
+        
+        # 更新流量数据
+        /usr/local/bin/gost-traffic-monitor.sh 2>/dev/null
+        
+        echo -e "${Blue_font_prefix}================================ 实时流量监控 ================================${Font_color_suffix}"
+        
+        if [ ! -f "$raw_conf_path" ] || [ ! -s "$raw_conf_path" ]; then
+            echo -e "${Warning} 暂无转发规则"
+            echo
+            echo -e "${Info} 按 Ctrl+C 返回主菜单"
+            sleep $refresh_interval
+            continue
+        fi
+        
+        if [ "$show_details" = true ]; then
+            printf "${Green_font_prefix}%-8s %-12s %-12s %-12s %-10s %-10s %-12s${Font_color_suffix}\n" \
+                "端口" "入站流量" "出站流量" "总流量" "入站速率" "出站速率" "今日流量"
+            echo -e "${Blue_font_prefix}------------------------------------------------------------------------------${Font_color_suffix}"
+            
+            local total_in=0
+            local total_out=0
+            local total_all=0
+            local total_speed_in=0
+            local total_speed_out=0
+            
+            while IFS= read -r line; do
+                local port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
+                
+                # 获取实时数据
+                local realtime_data=$(get_realtime_traffic "$port")
+                local in_bytes=$(echo "$realtime_data" | cut -d: -f1)
+                local out_bytes=$(echo "$realtime_data" | cut -d: -f2)
+                local total_bytes=$(echo "$realtime_data" | cut -d: -f3)
+                local speed_in=$(echo "$realtime_data" | cut -d: -f4)
+                local speed_out=$(echo "$realtime_data" | cut -d: -f5)
+                
+                # 获取今日流量
+                local traffic_info=$(get_port_traffic "$port")
+                local today_traffic=$(echo "$traffic_info" | cut -d: -f1)
+                
+                total_in=$((total_in + in_bytes))
+                total_out=$((total_out + out_bytes))
+                total_all=$((total_all + total_bytes))
+                total_speed_in=$((total_speed_in + speed_in))
+                total_speed_out=$((total_speed_out + speed_out))
+                
+                printf "%-8s %-12s %-12s %-12s %-10s %-10s %-12s\n" \
+                    "$port" \
+                    "$(format_bytes $in_bytes)" \
+                    "$(format_bytes $out_bytes)" \
+                    "$(format_bytes $total_bytes)" \
+                    "$(format_bytes $speed_in)/s" \
+                    "$(format_bytes $speed_out)/s" \
+                    "$(format_bytes $today_traffic)"
+            done < "$raw_conf_path"
+            
+            echo -e "${Blue_font_prefix}------------------------------------------------------------------------------${Font_color_suffix}"
+            printf "${Yellow_font_prefix}%-8s %-12s %-12s %-12s %-10s %-10s${Font_color_suffix}\n" \
+                "总计" \
+                "$(format_bytes $total_in)" \
+                "$(format_bytes $total_out)" \
+                "$(format_bytes $total_all)" \
+                "$(format_bytes $total_speed_in)/s" \
+                "$(format_bytes $total_speed_out)/s"
+        fi
+        
+        echo
+        echo -e "${Info} 刷新间隔: ${refresh_interval}秒 | 按 [+/-] 调整刷新速度 | 按 [q] 返回"
+        echo -e "${Info} 流量统计每分钟自动更新 | 最后更新: $(date '+%H:%M:%S')"
+        
+        # 非阻塞读取用户输入
+        read -t $refresh_interval -n 1 key
+        case $key in
+            q|Q) break ;;
+            +) [ $refresh_interval -gt 1 ] && ((refresh_interval--)) ;;
+            -) [ $refresh_interval -lt 10 ] && ((refresh_interval++)) ;;
+        esac
+    done
+}
+
+show_traffic_details() {
+    echo -e "${Blue_font_prefix}================================ 流量统计详情 ================================${Font_color_suffix}"
+    if [ ! -f "$raw_conf_path" ] || [ ! -s "$raw_conf_path" ]; then
+        echo -e "${Warning} 暂无转发规则"
+        echo
+        return
+    fi
+
+    printf "${Green_font_prefix}%-8s %-12s %-12s %-12s %-12s %-12s${Font_color_suffix}\n" \
+        "端口" "入站流量" "出站流量" "总流量" "今日流量" "本月流量"
+    echo -e "${Blue_font_prefix}------------------------------------------------------------------------------${Font_color_suffix}"
+    
+    local total_in=0
+    local total_out=0
+    local total_all=0
+    local total_today=0
+    local total_month=0
+    
+    while IFS= read -r line; do
+        local port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
+        
+        # 获取实时流量
+        local realtime_data=$(get_realtime_traffic "$port")
+        local in_bytes=$(echo "$realtime_data" | cut -d: -f1)
+        local out_bytes=$(echo "$realtime_data" | cut -d: -f2)
+        local total_bytes=$(echo "$realtime_data" | cut -d: -f3)
+        
+        # 获取历史流量
+        local traffic_data=$(grep "^$port:" "$traffic_path" 2>/dev/null)
+        if [ -n "$traffic_data" ]; then
+            local today=$(echo "$traffic_data" | cut -d: -f5)
+            local month=$(echo "$traffic_data" | cut -d: -f6)
+            
+            total_in=$((total_in + in_bytes))
+            total_out=$((total_out + out_bytes))
+            total_all=$((total_all + total_bytes))
+            total_today=$((total_today + today))
+            total_month=$((total_month + month))
+            
+            printf "%-8s %-12s %-12s %-12s %-12s %-12s\n" \
+                "$port" \
+                "$(format_bytes $in_bytes)" \
+                "$(format_bytes $out_bytes)" \
+                "$(format_bytes $total_bytes)" \
+                "$(format_bytes $today)" \
+                "$(format_bytes $month)"
+        else
+            printf "%-8s %-12s %-12s %-12s %-12s %-12s\n" \
+                "$port" "0B" "0B" "0B" "0B" "0B"
+        fi
+    done < "$raw_conf_path"
+    
+    echo -e "${Blue_font_prefix}------------------------------------------------------------------------------${Font_color_suffix}"
+    printf "${Yellow_font_prefix}%-8s %-12s %-12s %-12s %-12s %-12s${Font_color_suffix}\n" \
+        "总计" \
+        "$(format_bytes $total_in)" \
+        "$(format_bytes $total_out)" \
+        "$(format_bytes $total_all)" \
+        "$(format_bytes $total_today)" \
+        "$(format_bytes $total_month)"
     echo
 }
 
@@ -576,59 +792,6 @@ rebuild_config() {
     systemctl restart gost >/dev/null 2>&1
 }
 
-show_traffic_details() {
-    echo -e "${Blue_font_prefix}================================ 流量统计详情 ================================${Font_color_suffix}"
-    if [ ! -f "$raw_conf_path" ] || [ ! -s "$raw_conf_path" ]; then
-        echo -e "${Warning} 暂无转发规则"
-        echo
-        return
-    fi
-
-    printf "${Green_font_prefix}%-8s %-15s %-15s %-15s %-12s${Font_color_suffix}\n" \
-        "端口" "今日流量" "本月流量" "总流量" "当前速率"
-    echo -e "${Blue_font_prefix}------------------------------------------------------------------------------${Font_color_suffix}"
-    
-    local total_today=0
-    local total_month=0
-    local total_all=0
-    
-    while IFS= read -r line; do
-        local port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
-        
-        local traffic_data=$(grep "^$port:" "$traffic_path" 2>/dev/null)
-        if [ -n "$traffic_data" ]; then
-            local total=$(echo "$traffic_data" | cut -d: -f2)
-            local today=$(echo "$traffic_data" | cut -d: -f3)
-            local month=$(echo "$traffic_data" | cut -d: -f4)
-            
-            local traffic_info=$(get_port_traffic "$port")
-            local speed=$(echo "$traffic_info" | cut -d: -f3)
-            
-            total_today=$((total_today + today))
-            total_month=$((total_month + month))
-            total_all=$((total_all + total))
-            
-            printf "%-8s %-15s %-15s %-15s %-12s\n" \
-                "$port" \
-                "$(format_bytes $today)" \
-                "$(format_bytes $month)" \
-                "$(format_bytes $total)" \
-                "$(format_bytes $speed)/s"
-        else
-            printf "%-8s %-15s %-15s %-15s %-12s\n" \
-                "$port" "0B" "0B" "0B" "0B/s"
-        fi
-    done < "$raw_conf_path"
-    
-    echo -e "${Blue_font_prefix}------------------------------------------------------------------------------${Font_color_suffix}"
-    printf "${Yellow_font_prefix}%-8s %-15s %-15s %-15s${Font_color_suffix}\n" \
-        "总计" \
-        "$(format_bytes $total_today)" \
-        "$(format_bytes $total_month)" \
-        "$(format_bytes $total_all)"
-    echo
-}
-
 manage_forwards() {
     while true; do
         show_header
@@ -637,9 +800,10 @@ manage_forwards() {
         echo -e "${Green_font_prefix}=================== 转发管理 ===================${Font_color_suffix}"
         echo -e "${Green_font_prefix}1.${Font_color_suffix} 新增转发规则"
         echo -e "${Green_font_prefix}2.${Font_color_suffix} 删除转发规则"
-        echo -e "${Green_font_prefix}3.${Font_color_suffix} 查看流量详情"
-        echo -e "${Green_font_prefix}4.${Font_color_suffix} 立即清理过期规则"
-        echo -e "${Green_font_prefix}5.${Font_color_suffix} 重启GOST服务"
+        echo -e "${Green_font_prefix}3.${Font_color_suffix} 实时流量监控"
+        echo -e "${Green_font_prefix}4.${Font_color_suffix} 流量统计详情"
+        echo -e "${Green_font_prefix}5.${Font_color_suffix} 立即清理过期规则"
+        echo -e "${Green_font_prefix}6.${Font_color_suffix} 重启GOST服务"
         echo -e "${Green_font_prefix}0.${Font_color_suffix} 返回主菜单"
         echo
         read -p "请选择操作: " choice
@@ -647,18 +811,19 @@ manage_forwards() {
         case $choice in
             1) add_forward_rule ;;
             2) delete_forward_rule ;;
-            3) 
+            3) show_traffic_realtime ;;
+            4) 
                 clear
                 show_header
                 show_traffic_details
                 read -p "按Enter返回..."
                 ;;
-            4) 
+            5) 
                 /usr/local/bin/gost-expire-check.sh
                 echo -e "${Info} 已清理过期规则"
                 sleep 2
                 ;;
-            5) 
+            6) 
                 systemctl restart gost && echo -e "${Info} 服务已重启"
                 if [ -f "$raw_conf_path" ] && [ -s "$raw_conf_path" ]; then
                     while IFS= read -r line; do
@@ -678,38 +843,40 @@ traffic_management() {
     while true; do
         show_header
         echo -e "${Green_font_prefix}=================== 流量管理 ===================${Font_color_suffix}"
-        echo -e "${Green_font_prefix}1.${Font_color_suffix} 查看流量统计"
-        echo -e "${Green_font_prefix}2.${Font_color_suffix} 重置今日流量"
-        echo -e "${Green_font_prefix}3.${Font_color_suffix} 重置本月流量"
-        echo -e "${Green_font_prefix}4.${Font_color_suffix} 立即更新流量数据"
-        echo -e "${Green_font_prefix}5.${Font_color_suffix} 导出流量报表"
+        echo -e "${Green_font_prefix}1.${Font_color_suffix} 实时流量监控"
+        echo -e "${Green_font_prefix}2.${Font_color_suffix} 流量统计详情"
+        echo -e "${Green_font_prefix}3.${Font_color_suffix} 重置今日流量"
+        echo -e "${Green_font_prefix}4.${Font_color_suffix} 重置本月流量"
+        echo -e "${Green_font_prefix}5.${Font_color_suffix} 立即更新流量数据"
+        echo -e "${Green_font_prefix}6.${Font_color_suffix} 导出流量报表"
         echo -e "${Green_font_prefix}0.${Font_color_suffix} 返回主菜单"
         echo
         read -p "请选择操作: " choice
         
         case $choice in
-            1) 
+            1) show_traffic_realtime ;;
+            2) 
                 clear
                 show_header
                 show_traffic_details
                 read -p "按Enter返回..."
                 ;;
-            2) 
+            3) 
                 /usr/local/bin/gost-traffic-reset.sh daily
                 echo -e "${Info} 今日流量已重置"
                 sleep 2
                 ;;
-            3) 
+            4) 
                 /usr/local/bin/gost-traffic-reset.sh monthly
                 echo -e "${Info} 本月流量已重置"
                 sleep 2
                 ;;
-            4) 
+            5) 
                 /usr/local/bin/gost-traffic-monitor.sh
                 echo -e "${Info} 流量数据已更新"
                 sleep 2
                 ;;
-            5)
+            6)
                 report_file="/tmp/gost_traffic_report_$(date +%Y%m%d_%H%M%S).txt"
                 echo "GOST流量统计报表 - $(date '+%Y-%m-%d %H:%M:%S')" > "$report_file"
                 echo "================================================" >> "$report_file"
@@ -722,17 +889,23 @@ traffic_management() {
                         target_port=$(echo "$line" | cut -d'#' -f3)
                         remark=$(grep "^${port}:" "$remarks_path" 2>/dev/null | cut -d':' -f2- || echo "无")
                         
+                        realtime_data=$(get_realtime_traffic "$port")
+                        in_bytes=$(echo "$realtime_data" | cut -d: -f1)
+                        out_bytes=$(echo "$realtime_data" | cut -d: -f2)
+                        total_bytes=$(echo "$realtime_data" | cut -d: -f3)
+                        
                         traffic_data=$(grep "^$port:" "$traffic_path" 2>/dev/null)
                         if [ -n "$traffic_data" ]; then
-                            total=$(echo "$traffic_data" | cut -d: -f2)
-                            today=$(echo "$traffic_data" | cut -d: -f3)
-                            month=$(echo "$traffic_data" | cut -d: -f4)
+                            today=$(echo "$traffic_data" | cut -d: -f5)
+                            month=$(echo "$traffic_data" | cut -d: -f6)
                             
                             echo "端口: $port -> $target:$target_port" >> "$report_file"
                             echo "备注: $remark" >> "$report_file"
+                            echo "入站流量: $(format_bytes $in_bytes)" >> "$report_file"
+                            echo "出站流量: $(format_bytes $out_bytes)" >> "$report_file"
+                            echo "总流量: $(format_bytes $total_bytes)" >> "$report_file"
                             echo "今日流量: $(format_bytes $today)" >> "$report_file"
                             echo "本月流量: $(format_bytes $month)" >> "$report_file"
-                            echo "总流量: $(format_bytes $total)" >> "$report_file"
                             echo "------------------------------------------------" >> "$report_file"
                         fi
                     done < "$raw_conf_path"
@@ -774,7 +947,7 @@ system_management() {
                 if [ -f /etc/cron.d/gost-expire ]; then
                     echo -e "${Info} 定时任务: 已配置"
                     echo -e "  - 到期检查: 每小时执行"
-                    echo -e "  - 流量统计: 每5分钟执行"
+                    echo -e "  - 流量统计: 每分钟执行"
                 else
                     echo -e "${Warning} 定时任务: 未配置"
                 fi
