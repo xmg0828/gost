@@ -1,7 +1,6 @@
 #!/bin/bash
-# GOST管理脚本 v3.1 - 完全修复版
-# 作者: github.com/xmg0828-01
-# 功能: 端口转发管理、流量统计、到期时间管理
+# GOST管理脚本 v3.2 - 最终修复版
+# 修复: g命令、GOST 3.x版本、流量统计、到期时间
 
 # 颜色定义
 RED="\033[31m"
@@ -11,8 +10,8 @@ BLUE="\033[34m"
 PLAIN="\033[0m"
 
 # 版本信息
-SCRIPT_VERSION="3.1"
-GOST_VERSION="2.11.5"
+SCRIPT_VERSION="3.2"
+GOST_VERSION="3.0.0-rc10"  # 使用GOST 3.x最新版本
 
 # 配置路径
 CONFIG_DIR="/etc/gost"
@@ -64,29 +63,41 @@ install_deps() {
     fi
 }
 
-# 下载并安装GOST
+# 下载并安装GOST 3.x
 install_gost() {
-    echo -e "${GREEN}开始安装GOST...${PLAIN}"
+    echo -e "${GREEN}开始安装GOST 3.x...${PLAIN}"
     
     # 停止旧服务
     systemctl stop gost >/dev/null 2>&1
     
-    # 下载最新版GOST
+    # 下载GOST 3.x
     cd /tmp
-    DOWNLOAD_URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-${ARCH}-${GOST_VERSION}.gz"
+    DOWNLOAD_URL="https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_${ARCH}.tar.gz"
     
     echo -e "${GREEN}下载GOST ${GOST_VERSION}...${PLAIN}"
-    if ! wget --no-check-certificate -q --show-progress --timeout=30 -O gost.gz "${DOWNLOAD_URL}"; then
+    if ! wget --no-check-certificate -q --show-progress --timeout=30 -O gost.tar.gz "${DOWNLOAD_URL}"; then
         echo -e "${YELLOW}Github下载失败，尝试镜像源...${PLAIN}"
         MIRROR_URL="https://ghproxy.com/${DOWNLOAD_URL}"
-        if ! wget --no-check-certificate -q --show-progress --timeout=30 -O gost.gz "${MIRROR_URL}"; then
-            echo -e "${RED}下载失败${PLAIN}"
-            exit 1
+        if ! wget --no-check-certificate -q --show-progress --timeout=30 -O gost.tar.gz "${MIRROR_URL}"; then
+            echo -e "${YELLOW}GOST 3.x下载失败，使用2.11.5版本${PLAIN}"
+            # 回退到2.11.5版本
+            GOST_VERSION="2.11.5"
+            DOWNLOAD_URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-${ARCH}-${GOST_VERSION}.gz"
+            if ! wget --no-check-certificate -q --show-progress --timeout=30 -O gost.gz "${DOWNLOAD_URL}"; then
+                echo -e "${RED}下载失败${PLAIN}"
+                exit 1
+            fi
+            gunzip -f gost.gz
+            chmod +x gost
+        else
+            tar -xzf gost.tar.gz
+            chmod +x gost
         fi
+    else
+        tar -xzf gost.tar.gz
+        chmod +x gost
     fi
     
-    gunzip -f gost.gz
-    chmod +x gost
     mv -f gost /usr/bin/gost
     
     # 创建配置目录
@@ -121,30 +132,56 @@ EOF
     systemctl start gost
     
     # 创建定时任务检查过期
-    cat > /usr/local/bin/check-gost-expire.sh <<'EOF'
+    cat > /usr/local/bin/check-gost-expire.sh <<'EXPIRE_SCRIPT'
 #!/bin/bash
 CONFIG_DIR="/etc/gost"
 RAW_CONFIG="${CONFIG_DIR}/rawconf"
 EXPIRES_FILE="${CONFIG_DIR}/expires.txt"
+GOST_CONFIG="${CONFIG_DIR}/config.json"
 
 current_time=$(date +%s)
 need_rebuild=false
 
 if [[ -f ${EXPIRES_FILE} ]]; then
+    temp_file="/tmp/expires_temp_$$"
+    > ${temp_file}
+    
     while IFS=: read -r port expire_time; do
         if [[ "${expire_time}" != "永久" ]] && [[ ${expire_time} -le ${current_time} ]]; then
             sed -i "/\/${port}#/d" ${RAW_CONFIG}
-            sed -i "/^${port}:/d" ${EXPIRES_FILE}
             sed -i "/^${port}:/d" ${CONFIG_DIR}/remarks.txt
             need_rebuild=true
+            echo "[$(date)] 端口 ${port} 已过期并删除" >> /var/log/gost.log
+        else
+            echo "${port}:${expire_time}" >> ${temp_file}
         fi
     done < ${EXPIRES_FILE}
+    
+    mv -f ${temp_file} ${EXPIRES_FILE}
 fi
 
 if [[ ${need_rebuild} == true ]]; then
-    /usr/local/bin/gost-manager --rebuild
+    # 重建配置
+    if [[ ! -s ${RAW_CONFIG} ]]; then
+        echo '{"Debug":false,"Retries":0,"ServeNodes":[]}' > ${GOST_CONFIG}
+    else
+        echo '{"Debug":false,"Retries":0,"ServeNodes":[' > ${GOST_CONFIG}
+        first=true
+        while IFS= read -r line; do
+            port=$(echo "${line}" | cut -d'/' -f2 | cut -d'#' -f1)
+            target=$(echo "${line}" | cut -d'#' -f2)
+            target_port=$(echo "${line}" | cut -d'#' -f3)
+            
+            [[ ${first} == false ]] && echo "," >> ${GOST_CONFIG}
+            echo -n "\"tcp://:${port}/${target}:${target_port}\",\"udp://:${port}/${target}:${target_port}\"" >> ${GOST_CONFIG}
+            first=false
+        done < ${RAW_CONFIG}
+        echo "" >> ${GOST_CONFIG}
+        echo "]}" >> ${GOST_CONFIG}
+    fi
+    systemctl restart gost
 fi
-EOF
+EXPIRE_SCRIPT
     chmod +x /usr/local/bin/check-gost-expire.sh
     
     # 添加cron任务 (每小时检查)
@@ -153,23 +190,23 @@ EOF
     echo -e "${GREEN}GOST安装完成${PLAIN}"
 }
 
-# 创建快捷命令 - 修复版
-create_shortcut() {
-    # 获取脚本实际路径
-    SCRIPT_PATH=$(readlink -f "$0")
+# 修复g命令 - 确保能正常工作
+fix_g_command() {
+    # 获取当前脚本的实际路径
+    CURRENT_SCRIPT=$(readlink -f "$0")
     
-    # 复制脚本到系统目录
-    cp -f "${SCRIPT_PATH}" /usr/local/bin/gost-manager
+    # 复制脚本到固定位置
+    cp -f "${CURRENT_SCRIPT}" /usr/local/bin/gost-manager
     chmod +x /usr/local/bin/gost-manager
     
-    # 创建g命令脚本
+    # 创建g命令 - 直接指向脚本
     cat > /usr/bin/g <<'EOF'
 #!/bin/bash
-/usr/local/bin/gost-manager "$@"
+exec /usr/local/bin/gost-manager "$@"
 EOF
     chmod +x /usr/bin/g
     
-    echo -e "${GREEN}快捷命令 'g' 创建成功${PLAIN}"
+    echo -e "${GREEN}快捷命令 'g' 修复成功${PLAIN}"
 }
 
 # 初始化iptables规则
@@ -223,17 +260,15 @@ get_port_traffic() {
     local in_bytes=0
     local out_bytes=0
     
-    # 获取入站流量 (使用awk处理科学计数法)
-    local tcp_in=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep tcp | awk '{printf "%.0f\n", $2}' | awk '{sum+=$1}END{printf "%.0f", sum+0}')
-    local udp_in=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep udp | awk '{printf "%.0f\n", $2}' | awk '{sum+=$1}END{printf "%.0f", sum+0}')
+    # 使用awk处理可能的科学计数法
+    local tcp_in=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep tcp | awk '{s=sprintf("%.0f",$2); sum+=s}END{printf "%.0f", sum+0}')
+    local udp_in=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep udp | awk '{s=sprintf("%.0f",$2); sum+=s}END{printf "%.0f", sum+0}')
+    local tcp_out=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep tcp | awk '{s=sprintf("%.0f",$2); sum+=s}END{printf "%.0f", sum+0}')
+    local udp_out=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep udp | awk '{s=sprintf("%.0f",$2); sum+=s}END{printf "%.0f", sum+0}')
     
-    # 获取出站流量
-    local tcp_out=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep tcp | awk '{printf "%.0f\n", $2}' | awk '{sum+=$1}END{printf "%.0f", sum+0}')
-    local udp_out=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep udp | awk '{printf "%.0f\n", $2}' | awk '{sum+=$1}END{printf "%.0f", sum+0}')
-    
-    # 使用printf确保是整数
-    printf -v in_bytes "%.0f" "$((tcp_in + udp_in))"
-    printf -v out_bytes "%.0f" "$((tcp_out + udp_out))"
+    # 计算总流量
+    in_bytes=$(awk "BEGIN{printf \"%.0f\", ${tcp_in}+${udp_in}}")
+    out_bytes=$(awk "BEGIN{printf \"%.0f\", ${tcp_out}+${udp_out}}")
     
     echo "${in_bytes}:${out_bytes}"
 }
@@ -242,17 +277,18 @@ get_port_traffic() {
 format_bytes() {
     local bytes=$1
     
-    # 确保是整数
-    printf -v bytes "%.0f" "${bytes}"
+    # 确保是数字
+    bytes=$(echo "${bytes}" | sed 's/[^0-9]//g')
+    [[ -z ${bytes} ]] && bytes=0
     
     if [[ ${bytes} -lt 1024 ]]; then
         echo "${bytes}B"
     elif [[ ${bytes} -lt 1048576 ]]; then
-        echo "$(echo "scale=2; ${bytes}/1024" | bc)KB"
+        echo "$(awk "BEGIN{printf \"%.2f\", ${bytes}/1024}")KB"
     elif [[ ${bytes} -lt 1073741824 ]]; then
-        echo "$(echo "scale=2; ${bytes}/1048576" | bc)MB"
+        echo "$(awk "BEGIN{printf \"%.2f\", ${bytes}/1048576}")MB"
     else
-        echo "$(echo "scale=2; ${bytes}/1073741824" | bc)GB"
+        echo "$(awk "BEGIN{printf \"%.2f\", ${bytes}/1073741824}")GB"
     fi
 }
 
@@ -312,18 +348,23 @@ check_expired() {
     local need_rebuild=false
     
     if [[ -f ${EXPIRES_FILE} ]]; then
+        local temp_file="/tmp/expires_temp_$$"
+        > ${temp_file}
+        
         while IFS=: read -r port expire_time; do
             if [[ "${expire_time}" != "永久" ]] && [[ ${expire_time} -le ${current_time} ]]; then
                 # 删除过期规则
                 sed -i "/\/${port}#/d" ${RAW_CONFIG}
-                sed -i "/^${port}:/d" ${EXPIRES_FILE}
                 sed -i "/^${port}:/d" ${REMARKS_FILE}
-                sed -i "/^${port}:/d" ${TRAFFIC_DB}
                 del_traffic_rule ${port}
                 need_rebuild=true
                 echo -e "${YELLOW}端口 ${port} 已过期并删除${PLAIN}"
+            else
+                echo "${port}:${expire_time}" >> ${temp_file}
             fi
         done < ${EXPIRES_FILE}
+        
+        mv -f ${temp_file} ${EXPIRES_FILE}
     fi
     
     if [[ ${need_rebuild} == true ]]; then
@@ -340,7 +381,7 @@ show_header() {
     
     # 显示系统状态
     local gost_status=$(systemctl is-active gost 2>/dev/null || echo "未运行")
-    local gost_version=$(gost -V 2>/dev/null | awk '{print $2}' || echo "未安装")
+    local gost_version=$(gost -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "未安装")
     local rule_count=$(wc -l < ${RAW_CONFIG} 2>/dev/null || echo "0")
     
     echo -e "GOST状态: ${GREEN}${gost_status}${PLAIN} | 版本: ${GREEN}${gost_version}${PLAIN} | 规则数: ${GREEN}${rule_count}${PLAIN}"
@@ -378,7 +419,7 @@ show_forwards() {
         local traffic_data=$(get_port_traffic ${port})
         local in_bytes=$(echo "${traffic_data}" | cut -d':' -f1)
         local out_bytes=$(echo "${traffic_data}" | cut -d':' -f2)
-        local total_bytes=$((in_bytes + out_bytes))
+        local total_bytes=$(awk "BEGIN{printf \"%.0f\", ${in_bytes}+${out_bytes}}")
         local traffic_display=$(format_bytes ${total_bytes})
         
         # 颜色显示
@@ -532,14 +573,10 @@ show_traffic() {
         local traffic_data=$(get_port_traffic ${port})
         local in_bytes=$(echo "${traffic_data}" | cut -d':' -f1)
         local out_bytes=$(echo "${traffic_data}" | cut -d':' -f2)
-        local total_bytes=$((in_bytes + out_bytes))
+        local total_bytes=$(awk "BEGIN{printf \"%.0f\", ${in_bytes}+${out_bytes}}")
         
-        # 确保是整数
-        printf -v in_bytes "%.0f" "${in_bytes}"
-        printf -v out_bytes "%.0f" "${out_bytes}"
-        
-        total_in=$((total_in + in_bytes))
-        total_out=$((total_out + out_bytes))
+        total_in=$(awk "BEGIN{printf \"%.0f\", ${total_in}+${in_bytes}}")
+        total_out=$(awk "BEGIN{printf \"%.0f\", ${total_out}+${out_bytes}}")
         
         printf "%-10s %-15s %-15s %-15s\n" \
             "${port}" \
@@ -549,11 +586,19 @@ show_traffic() {
     done < ${RAW_CONFIG}
     
     echo -e "${BLUE}-----------------------------------------------------------${PLAIN}"
+    local total_all=$(awk "BEGIN{printf \"%.0f\", ${total_in}+${total_out}}")
     printf "%-10s %-15s %-15s %-15s\n" \
         "总计" \
         "$(format_bytes ${total_in})" \
         "$(format_bytes ${total_out})" \
-        "$(format_bytes $((total_in + total_out)))"
+        "$(format_bytes ${total_all})"
+}
+
+# 更新GOST到最新版本
+update_gost() {
+    echo -e "${GREEN}检查GOST最新版本...${PLAIN}"
+    install_gost
+    echo -e "${GREEN}更新完成${PLAIN}"
 }
 
 # 主菜单
@@ -569,11 +614,12 @@ main_menu() {
         echo -e "${GREEN}3.${PLAIN} 查看流量统计"
         echo -e "${GREEN}4.${PLAIN} 重启GOST服务"
         echo -e "${GREEN}5.${PLAIN} 更新GOST版本"
-        echo -e "${GREEN}6.${PLAIN} 卸载GOST"
+        echo -e "${GREEN}6.${PLAIN} 修复g命令"
+        echo -e "${GREEN}7.${PLAIN} 卸载GOST"
         echo -e "${GREEN}0.${PLAIN} 退出"
         echo
         
-        read -p "请选择 [0-6]: " choice
+        read -p "请选择 [0-7]: " choice
         
         case ${choice} in
             1)
@@ -597,10 +643,15 @@ main_menu() {
                 sleep 2
                 ;;
             5)
-                install_gost
+                update_gost
                 sleep 2
                 ;;
             6)
+                fix_g_command
+                echo -e "${GREEN}请重新输入 g 命令进入面板${PLAIN}"
+                sleep 2
+                ;;
+            7)
                 read -p "确定要卸载GOST吗？(y/n): " confirm
                 if [[ ${confirm} == "y" ]]; then
                     systemctl stop gost
@@ -637,12 +688,6 @@ main() {
     check_root
     check_system
     
-    # 处理命令行参数
-    if [[ "$1" == "--rebuild" ]]; then
-        rebuild_config
-        exit 0
-    fi
-    
     # 检查是否已安装
     if [[ ! -f /usr/bin/gost ]]; then
         echo -e "${YELLOW}GOST未安装，开始安装...${PLAIN}"
@@ -651,8 +696,8 @@ main() {
         init_iptables
     fi
     
-    # 创建快捷命令
-    create_shortcut
+    # 始终修复g命令，确保可用
+    fix_g_command
     
     # 初始化iptables
     init_iptables
