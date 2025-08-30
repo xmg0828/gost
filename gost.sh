@@ -1,5 +1,5 @@
 #!/bin/bash
-# GOST管理脚本 v3.0 - 完全修复版
+# GOST管理脚本 v3.1 - 完全修复版
 # 作者: github.com/xmg0828-01
 # 功能: 端口转发管理、流量统计、到期时间管理
 
@@ -11,7 +11,7 @@ BLUE="\033[34m"
 PLAIN="\033[0m"
 
 # 版本信息
-SCRIPT_VERSION="3.0"
+SCRIPT_VERSION="3.1"
 GOST_VERSION="2.11.5"
 
 # 配置路径
@@ -57,10 +57,10 @@ check_system() {
 install_deps() {
     echo -e "${GREEN}安装依赖包...${PLAIN}"
     if [[ ${OS} == "centos" ]]; then
-        yum install -y wget curl jq bc iptables >/dev/null 2>&1
+        yum install -y wget curl bc iptables >/dev/null 2>&1
     else
         apt-get update >/dev/null 2>&1
-        apt-get install -y wget curl jq bc iptables >/dev/null 2>&1
+        apt-get install -y wget curl bc iptables >/dev/null 2>&1
     fi
 }
 
@@ -120,17 +120,54 @@ EOF
     systemctl enable gost >/dev/null 2>&1
     systemctl start gost
     
+    # 创建定时任务检查过期
+    cat > /usr/local/bin/check-gost-expire.sh <<'EOF'
+#!/bin/bash
+CONFIG_DIR="/etc/gost"
+RAW_CONFIG="${CONFIG_DIR}/rawconf"
+EXPIRES_FILE="${CONFIG_DIR}/expires.txt"
+
+current_time=$(date +%s)
+need_rebuild=false
+
+if [[ -f ${EXPIRES_FILE} ]]; then
+    while IFS=: read -r port expire_time; do
+        if [[ "${expire_time}" != "永久" ]] && [[ ${expire_time} -le ${current_time} ]]; then
+            sed -i "/\/${port}#/d" ${RAW_CONFIG}
+            sed -i "/^${port}:/d" ${EXPIRES_FILE}
+            sed -i "/^${port}:/d" ${CONFIG_DIR}/remarks.txt
+            need_rebuild=true
+        fi
+    done < ${EXPIRES_FILE}
+fi
+
+if [[ ${need_rebuild} == true ]]; then
+    /usr/local/bin/gost-manager --rebuild
+fi
+EOF
+    chmod +x /usr/local/bin/check-gost-expire.sh
+    
+    # 添加cron任务 (每小时检查)
+    echo "0 * * * * root /usr/local/bin/check-gost-expire.sh >/dev/null 2>&1" > /etc/cron.d/gost-expire
+    
     echo -e "${GREEN}GOST安装完成${PLAIN}"
 }
 
-# 创建快捷命令
+# 创建快捷命令 - 修复版
 create_shortcut() {
+    # 获取脚本实际路径
+    SCRIPT_PATH=$(readlink -f "$0")
+    
     # 复制脚本到系统目录
-    cp -f "$0" /usr/local/bin/gost-manager
+    cp -f "${SCRIPT_PATH}" /usr/local/bin/gost-manager
     chmod +x /usr/local/bin/gost-manager
     
-    # 创建软链接
-    ln -sf /usr/local/bin/gost-manager /usr/bin/g
+    # 创建g命令脚本
+    cat > /usr/bin/g <<'EOF'
+#!/bin/bash
+/usr/local/bin/gost-manager "$@"
+EOF
+    chmod +x /usr/bin/g
     
     echo -e "${GREEN}快捷命令 'g' 创建成功${PLAIN}"
 }
@@ -180,21 +217,23 @@ del_traffic_rule() {
     iptables -t filter -D GOST -p udp --sport ${port} -j ACCEPT 2>/dev/null
 }
 
-# 获取端口流量
+# 获取端口流量 - 修复科学计数法问题
 get_port_traffic() {
     local port=$1
     local in_bytes=0
     local out_bytes=0
     
-    # 获取入站流量
-    local tcp_in=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep tcp | awk '{sum+=$2}END{print sum+0}')
-    local udp_in=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep udp | awk '{sum+=$2}END{print sum+0}')
-    in_bytes=$((tcp_in + udp_in))
+    # 获取入站流量 (使用awk处理科学计数法)
+    local tcp_in=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep tcp | awk '{printf "%.0f\n", $2}' | awk '{sum+=$1}END{printf "%.0f", sum+0}')
+    local udp_in=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep udp | awk '{printf "%.0f\n", $2}' | awk '{sum+=$1}END{printf "%.0f", sum+0}')
     
     # 获取出站流量
-    local tcp_out=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep tcp | awk '{sum+=$2}END{print sum+0}')
-    local udp_out=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep udp | awk '{sum+=$2}END{print sum+0}')
-    out_bytes=$((tcp_out + udp_out))
+    local tcp_out=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep tcp | awk '{printf "%.0f\n", $2}' | awk '{sum+=$1}END{printf "%.0f", sum+0}')
+    local udp_out=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep udp | awk '{printf "%.0f\n", $2}' | awk '{sum+=$1}END{printf "%.0f", sum+0}')
+    
+    # 使用printf确保是整数
+    printf -v in_bytes "%.0f" "$((tcp_in + udp_in))"
+    printf -v out_bytes "%.0f" "$((tcp_out + udp_out))"
     
     echo "${in_bytes}:${out_bytes}"
 }
@@ -202,6 +241,9 @@ get_port_traffic() {
 # 格式化字节数
 format_bytes() {
     local bytes=$1
+    
+    # 确保是整数
+    printf -v bytes "%.0f" "${bytes}"
     
     if [[ ${bytes} -lt 1024 ]]; then
         echo "${bytes}B"
@@ -211,6 +253,28 @@ format_bytes() {
         echo "$(echo "scale=2; ${bytes}/1048576" | bc)MB"
     else
         echo "$(echo "scale=2; ${bytes}/1073741824" | bc)GB"
+    fi
+}
+
+# 格式化到期时间
+format_expire_time() {
+    local expire_time=$1
+    
+    if [[ "${expire_time}" == "永久" ]]; then
+        echo "永久"
+    else
+        local current_time=$(date +%s)
+        local diff=$((expire_time - current_time))
+        
+        if [[ ${diff} -le 0 ]]; then
+            echo "已过期"
+        elif [[ ${diff} -lt 3600 ]]; then
+            echo "$((diff / 60))分钟"
+        elif [[ ${diff} -lt 86400 ]]; then
+            echo "$((diff / 3600))小时"
+        else
+            echo "$((diff / 86400))天"
+        fi
     fi
 }
 
@@ -292,9 +356,9 @@ show_forwards() {
     fi
     
     echo -e "${GREEN}转发规则列表:${PLAIN}"
-    echo -e "${BLUE}-----------------------------------------------------------${PLAIN}"
-    printf "%-4s %-10s %-25s %-15s %-12s\n" "ID" "端口" "目标" "备注" "流量"
-    echo -e "${BLUE}-----------------------------------------------------------${PLAIN}"
+    echo -e "${BLUE}--------------------------------------------------------------------------------${PLAIN}"
+    printf "%-4s %-10s %-25s %-12s %-10s %-15s\n" "ID" "端口" "目标" "备注" "到期" "流量"
+    echo -e "${BLUE}--------------------------------------------------------------------------------${PLAIN}"
     
     local id=1
     while IFS= read -r line; do
@@ -304,6 +368,11 @@ show_forwards() {
         
         # 获取备注
         local remark=$(grep "^${port}:" ${REMARKS_FILE} 2>/dev/null | cut -d':' -f2- || echo "-")
+        [[ ${#remark} -gt 10 ]] && remark="${remark:0:10}.."
+        
+        # 获取到期时间
+        local expire_time=$(grep "^${port}:" ${EXPIRES_FILE} 2>/dev/null | cut -d':' -f2 || echo "永久")
+        local expire_display=$(format_expire_time "${expire_time}")
         
         # 获取流量
         local traffic_data=$(get_port_traffic ${port})
@@ -312,8 +381,17 @@ show_forwards() {
         local total_bytes=$((in_bytes + out_bytes))
         local traffic_display=$(format_bytes ${total_bytes})
         
-        printf "%-4s %-10s %-25s %-15s %-12s\n" \
-            "${id}" "${port}" "${target}:${target_port}" "${remark}" "${traffic_display}"
+        # 颜色显示
+        if [[ "${expire_display}" == "已过期" ]]; then
+            expire_color="${RED}"
+        elif [[ "${expire_display}" == *"分钟"* ]] || [[ "${expire_display}" == *"小时"* ]]; then
+            expire_color="${YELLOW}"
+        else
+            expire_color=""
+        fi
+        
+        printf "%-4s %-10s %-25s %-12s ${expire_color}%-10s${PLAIN} %-15s\n" \
+            "${id}" "${port}" "${target}:${target_port}" "${remark}" "${expire_display}" "${traffic_display}"
         
         ((id++))
     done < ${RAW_CONFIG}
@@ -326,7 +404,7 @@ add_forward() {
     read -p "本地端口: " local_port
     read -p "目标地址: " target_ip
     read -p "目标端口: " target_port
-    read -p "备注信息: " remark
+    read -p "备注信息(可选): " remark
     
     # 验证输入
     if [[ ! ${local_port} =~ ^[0-9]+$ ]] || [[ ! ${target_port} =~ ^[0-9]+$ ]]; then
@@ -340,6 +418,43 @@ add_forward() {
         return
     fi
     
+    # 设置到期时间
+    echo -e "${GREEN}设置到期时间:${PLAIN}"
+    echo "1) 永久有效"
+    echo "2) 1小时"
+    echo "3) 1天"
+    echo "4) 7天"
+    echo "5) 30天"
+    echo "6) 自定义天数"
+    read -p "请选择 [1-6]: " expire_choice
+    
+    local expire_time="永久"
+    case ${expire_choice} in
+        2)
+            expire_time=$(($(date +%s) + 3600))
+            ;;
+        3)
+            expire_time=$(($(date +%s) + 86400))
+            ;;
+        4)
+            expire_time=$(($(date +%s) + 604800))
+            ;;
+        5)
+            expire_time=$(($(date +%s) + 2592000))
+            ;;
+        6)
+            read -p "请输入天数: " days
+            if [[ ${days} =~ ^[0-9]+$ ]]; then
+                expire_time=$(($(date +%s) + days * 86400))
+            else
+                expire_time="永久"
+            fi
+            ;;
+        *)
+            expire_time="永久"
+            ;;
+    esac
+    
     # 添加规则
     echo "tcp/${local_port}#${target_ip}#${target_port}" >> ${RAW_CONFIG}
     
@@ -348,8 +463,8 @@ add_forward() {
         echo "${local_port}:${remark}" >> ${REMARKS_FILE}
     fi
     
-    # 设置永久有效
-    echo "${local_port}:永久" >> ${EXPIRES_FILE}
+    # 保存到期时间
+    echo "${local_port}:${expire_time}" >> ${EXPIRES_FILE}
     
     # 添加流量统计
     add_traffic_rule ${local_port}
@@ -358,6 +473,9 @@ add_forward() {
     rebuild_config
     
     echo -e "${GREEN}添加成功: ${local_port} -> ${target_ip}:${target_port}${PLAIN}"
+    if [[ "${expire_time}" != "永久" ]]; then
+        echo -e "${GREEN}到期时间: $(format_expire_time ${expire_time})${PLAIN}"
+    fi
 }
 
 # 删除转发规则
@@ -415,6 +533,10 @@ show_traffic() {
         local in_bytes=$(echo "${traffic_data}" | cut -d':' -f1)
         local out_bytes=$(echo "${traffic_data}" | cut -d':' -f2)
         local total_bytes=$((in_bytes + out_bytes))
+        
+        # 确保是整数
+        printf -v in_bytes "%.0f" "${in_bytes}"
+        printf -v out_bytes "%.0f" "${out_bytes}"
         
         total_in=$((total_in + in_bytes))
         total_out=$((total_out + out_bytes))
@@ -485,8 +607,10 @@ main_menu() {
                     systemctl disable gost
                     rm -f /usr/bin/gost /usr/bin/g
                     rm -f /usr/local/bin/gost-manager
+                    rm -f /usr/local/bin/check-gost-expire.sh
                     rm -rf ${CONFIG_DIR}
                     rm -f /etc/systemd/system/gost.service
+                    rm -f /etc/cron.d/gost-expire
                     
                     # 清理iptables
                     iptables -t filter -F GOST 2>/dev/null
@@ -513,6 +637,12 @@ main() {
     check_root
     check_system
     
+    # 处理命令行参数
+    if [[ "$1" == "--rebuild" ]]; then
+        rebuild_config
+        exit 0
+    fi
+    
     # 检查是否已安装
     if [[ ! -f /usr/bin/gost ]]; then
         echo -e "${YELLOW}GOST未安装，开始安装...${PLAIN}"
@@ -522,9 +652,7 @@ main() {
     fi
     
     # 创建快捷命令
-    if [[ ! -f /usr/bin/g ]]; then
-        create_shortcut
-    fi
+    create_shortcut
     
     # 初始化iptables
     init_iptables
