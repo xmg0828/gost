@@ -43,7 +43,6 @@ install_gost() {
     echo -e "${Info} 开始安装GOST..."
     detect_environment
     
-    # 安装基础工具
     echo -e "${Info} 安装基础工具..."
     if [[ $release == "centos" ]]; then
         yum install -y wget curl bc >/dev/null 2>&1
@@ -51,7 +50,6 @@ install_gost() {
         apt-get install -y wget curl bc >/dev/null 2>&1
     fi
     
-    # 下载GOST
     cd /tmp
     echo -e "${Info} 下载GOST程序..."
     if ! wget -q --timeout=30 -O gost.gz "https://github.com/ginuerzh/gost/releases/download/v${ct_new_ver}/gost-linux-${arch}-${ct_new_ver}.gz"; then
@@ -66,7 +64,6 @@ install_gost() {
     chmod +x gost
     mv gost /usr/bin/gost
     
-    # 创建systemd服务
     cat > /etc/systemd/system/gost.service << 'EOF'
 [Unit]
 Description=GOST
@@ -86,13 +83,9 @@ EOF
     systemctl daemon-reload
     systemctl enable gost
     
-    # 创建独立的到期检查脚本
     create_expire_check_script
-    
-    # 创建流量统计脚本
     create_traffic_monitor_script
     
-    # 设置定时任务 - 每小时检查到期，每5分钟统计流量
     echo "0 * * * * root /usr/local/bin/gost-expire-check.sh >/dev/null 2>&1" > /etc/cron.d/gost-expire
     echo "*/5 * * * * root /usr/local/bin/gost-traffic-monitor.sh >/dev/null 2>&1" >> /etc/cron.d/gost-expire
     echo "0 0 * * * root /usr/local/bin/gost-traffic-reset.sh daily >/dev/null 2>&1" >> /etc/cron.d/gost-expire
@@ -102,10 +95,8 @@ EOF
 }
 
 create_expire_check_script() {
-    cat > /usr/local/bin/gost-expire-check.sh << 'EOF'
+    cat > /usr/local/bin/gost-expire-check.sh << 'EXPIRE_EOF'
 #!/bin/bash
-# 独立的到期检查脚本
-
 EXPIRES_FILE="/etc/gost/expires.txt"
 RAW_CONF="/etc/gost/rawconf"
 GOST_CONF="/etc/gost/config.json"
@@ -125,11 +116,9 @@ done < "$EXPIRES_FILE"
 
 if [ "$need_rebuild" = true ]; then
     for port in $expired_ports; do
-        # 删除过期规则
         sed -i "/\/${port}#/d" "$RAW_CONF"
         sed -i "/^${port}:/d" "$EXPIRES_FILE"
         sed -i "/^${port}:/d" "/etc/gost/remarks.txt"
-        # 清理iptables规则
         iptables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
         iptables -D INPUT -p udp --dport $port -j ACCEPT 2>/dev/null
         iptables -t mangle -F GOST_$port 2>/dev/null
@@ -137,7 +126,6 @@ if [ "$need_rebuild" = true ]; then
         echo "[$(date)] 端口 $port 的转发规则已过期并删除" >> /var/log/gost.log
     done
     
-    # 重建配置
     if [ ! -f "$RAW_CONF" ] || [ ! -s "$RAW_CONF" ]; then
         echo '{"Debug":false,"Retries":0,"ServeNodes":[]}' > "$GOST_CONF"
     else
@@ -150,7 +138,428 @@ if [ "$need_rebuild" = true ]; then
             target=$(echo "$line" | cut -d'#' -f2)
             target_port=$(echo "$line" | cut -d'#' -f3)
             
-            echo -n "        \"tcp://:$port/$target:$target_port\",\"udp://:$port/$target:$target_port\"" >> "$gost_conf_path"
+            printf '        "tcp://:'"$port"'/'"$target"':'"$target_port"'","udp://:'"$port"'/'"$target"':'"$target_port"'"' >> "$GOST_CONF"
+            
+            if [ "$i" -lt "$count_line" ]; then
+                echo "," >> "$GOST_CONF"
+            else
+                echo "" >> "$GOST_CONF"
+            fi
+            ((i++))
+        done < "$RAW_CONF"
+        
+        echo "    ]" >> "$GOST_CONF"
+        echo "}" >> "$GOST_CONF"
+    fi
+    
+    systemctl restart gost >/dev/null 2>&1
+fi
+EXPIRE_EOF
+    chmod +x /usr/local/bin/gost-expire-check.sh
+}
+
+create_traffic_monitor_script() {
+    cat > /usr/local/bin/gost-traffic-monitor.sh << 'TRAFFIC_EOF'
+#!/bin/bash
+TRAFFIC_DB="/etc/gost/traffic.db"
+TRAFFIC_HISTORY="/etc/gost/traffic_history.db"
+RAW_CONF="/etc/gost/rawconf"
+
+[ ! -f "$RAW_CONF" ] && exit 0
+
+touch "$TRAFFIC_DB" "$TRAFFIC_HISTORY"
+
+current_time=$(date +%s)
+today=$(date +%Y%m%d)
+month=$(date +%Y%m)
+
+while IFS= read -r line; do
+    port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
+    
+    tcp_bytes=$(iptables -t mangle -nvxL GOST_$port 2>/dev/null | awk '/ACCEPT/{sum+=$2}END{print sum+0}')
+    udp_bytes=$(iptables -t mangle -nvxL GOST_$port 2>/dev/null | awk '/ACCEPT.*udp/{sum+=$2}END{print sum+0}')
+    total_bytes=$((tcp_bytes + udp_bytes))
+    
+    old_data=$(grep "^$port:" "$TRAFFIC_DB" 2>/dev/null)
+    if [ -n "$old_data" ]; then
+        old_total=$(echo "$old_data" | cut -d: -f2)
+        old_today=$(echo "$old_data" | cut -d: -f3)
+        old_month=$(echo "$old_data" | cut -d: -f4)
+        old_date=$(echo "$old_data" | cut -d: -f5)
+        old_month_date=$(echo "$old_data" | cut -d: -f6)
+        
+        if [ "$old_date" != "$today" ]; then
+            old_today=0
+        fi
+        
+        if [ "$old_month_date" != "$month" ]; then
+            old_month=0
+        fi
+        
+        if [ "$total_bytes" -ge "$old_total" ]; then
+            increment=$((total_bytes - old_total))
+        else
+            increment=$total_bytes
+        fi
+        
+        new_today=$((old_today + increment))
+        new_month=$((old_month + increment))
+        
+        sed -i "/^$port:/d" "$TRAFFIC_DB"
+        echo "$port:$total_bytes:$new_today:$new_month:$today:$month:$current_time" >> "$TRAFFIC_DB"
+    else
+        echo "$port:$total_bytes:$total_bytes:$total_bytes:$today:$month:$current_time" >> "$TRAFFIC_DB"
+    fi
+done < "$RAW_CONF"
+
+cp "$TRAFFIC_DB" "$TRAFFIC_HISTORY.$(date +%Y%m%d%H%M)"
+ls -t "$TRAFFIC_HISTORY".* 2>/dev/null | tail -n +101 | xargs rm -f 2>/dev/null
+TRAFFIC_EOF
+    chmod +x /usr/local/bin/gost-traffic-monitor.sh
+    
+    cat > /usr/local/bin/gost-traffic-reset.sh << 'RESET_EOF'
+#!/bin/bash
+TRAFFIC_DB="/etc/gost/traffic.db"
+reset_type="$1"
+
+if [ "$reset_type" = "daily" ]; then
+    while IFS=: read -r port total today month date month_date time; do
+        echo "$port:$total:0:$month:$(date +%Y%m%d):$month_date:$time"
+    done < "$TRAFFIC_DB" > "$TRAFFIC_DB.tmp"
+    mv "$TRAFFIC_DB.tmp" "$TRAFFIC_DB"
+elif [ "$reset_type" = "monthly" ]; then
+    while IFS=: read -r port total today month date month_date time; do
+        echo "$port:$total:$today:0:$date:$(date +%Y%m):$time"
+    done < "$TRAFFIC_DB" > "$TRAFFIC_DB.tmp"
+    mv "$TRAFFIC_DB.tmp" "$TRAFFIC_DB"
+fi
+RESET_EOF
+    chmod +x /usr/local/bin/gost-traffic-reset.sh
+}
+
+setup_iptables_for_port() {
+    local port=$1
+    iptables -t mangle -N GOST_$port 2>/dev/null
+    iptables -t mangle -C PREROUTING -p tcp --dport $port -j GOST_$port 2>/dev/null || \
+        iptables -t mangle -A PREROUTING -p tcp --dport $port -j GOST_$port
+    iptables -t mangle -C PREROUTING -p udp --dport $port -j GOST_$port 2>/dev/null || \
+        iptables -t mangle -A PREROUTING -p udp --dport $port -j GOST_$port
+    iptables -t mangle -C GOST_$port -j ACCEPT 2>/dev/null || \
+        iptables -t mangle -A GOST_$port -j ACCEPT
+}
+
+remove_iptables_for_port() {
+    local port=$1
+    iptables -t mangle -D PREROUTING -p tcp --dport $port -j GOST_$port 2>/dev/null
+    iptables -t mangle -D PREROUTING -p udp --dport $port -j GOST_$port 2>/dev/null
+    iptables -t mangle -F GOST_$port 2>/dev/null
+    iptables -t mangle -X GOST_$port 2>/dev/null
+}
+
+format_bytes() {
+    local bytes=$1
+    if [ "$bytes" -lt 1024 ]; then
+        echo "${bytes}B"
+    elif [ "$bytes" -lt 1048576 ]; then
+        echo "$(echo "scale=2; $bytes/1024" | bc)KB"
+    elif [ "$bytes" -lt 1073741824 ]; then
+        echo "$(echo "scale=2; $bytes/1048576" | bc)MB"
+    else
+        echo "$(echo "scale=2; $bytes/1073741824" | bc)GB"
+    fi
+}
+
+get_port_traffic() {
+    local port=$1
+    local traffic_data=$(grep "^$port:" "$traffic_path" 2>/dev/null)
+    
+    if [ -n "$traffic_data" ]; then
+        local today=$(echo "$traffic_data" | cut -d: -f3)
+        local month=$(echo "$traffic_data" | cut -d: -f4)
+        local last_update=$(echo "$traffic_data" | cut -d: -f7)
+        
+        local current_time=$(date +%s)
+        local time_diff=$((current_time - last_update))
+        if [ "$time_diff" -gt 0 ] && [ "$time_diff" -lt 600 ]; then
+            local current_bytes=$(iptables -t mangle -nvxL GOST_$port 2>/dev/null | awk '/ACCEPT/{sum+=$2}END{print sum+0}')
+            local old_bytes=$(echo "$traffic_data" | cut -d: -f2)
+            local bytes_diff=$((current_bytes - old_bytes))
+            if [ "$bytes_diff" -lt 0 ]; then bytes_diff=0; fi
+            local speed=$((bytes_diff / time_diff))
+        else
+            local speed=0
+        fi
+        
+        echo "$today:$month:$speed"
+    else
+        echo "0:0:0"
+    fi
+}
+
+create_shortcut() {
+    echo -e "${Info} 创建快捷命令..."
+    
+    if is_oneclick_install; then
+        if wget -q -O /usr/local/bin/gost-manager.sh "https://raw.githubusercontent.com/xmg0828-01/gost/main/gost.sh"; then
+            chmod +x /usr/local/bin/gost-manager.sh
+        else
+            cat > /usr/local/bin/gost-manager.sh << 'EOF'
+#!/bin/bash
+bash <(curl -sSL https://raw.githubusercontent.com/xmg0828-01/gost/main/gost.sh) --menu
+EOF
+            chmod +x /usr/local/bin/gost-manager.sh
+        fi
+    else
+        cp "$0" /usr/local/bin/gost-manager.sh
+        chmod +x /usr/local/bin/gost-manager.sh
+    fi
+    
+    ln -sf /usr/local/bin/gost-manager.sh /usr/bin/g
+    echo -e "${Info} 快捷命令 'g' 创建成功"
+}
+
+init_config() {
+    mkdir -p /etc/gost
+    touch /etc/gost/{rawconf,remarks.txt,expires.txt,traffic.db,traffic_history.db}
+    [ ! -f "$gost_conf_path" ] && echo '{"Debug":false,"Retries":0,"ServeNodes":[]}' > "$gost_conf_path"
+    
+    if [ -f "$raw_conf_path" ] && [ -s "$raw_conf_path" ]; then
+        while IFS= read -r line; do
+            port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
+            setup_iptables_for_port "$port"
+        done < "$raw_conf_path"
+    fi
+}
+
+show_header() {
+    clear
+    echo -e "${Blue_font_prefix}======================================================${Font_color_suffix}"
+    echo -e "${Green_font_prefix}          GOST 增强版管理面板 v${shell_version}${Font_color_suffix}"
+    echo -e "${Blue_font_prefix}======================================================${Font_color_suffix}"
+    echo -e "${Yellow_font_prefix}功能: 转发管理 | 到期时间 | 流量统计 | 备注信息${Font_color_suffix}"
+    echo -e "${Blue_font_prefix}======================================================${Font_color_suffix}"
+    echo
+}
+
+check_expired_rules() {
+    local expired_count=0
+    local current_date=$(date +%s)
+    
+    if [ -f "$expires_path" ]; then
+        while IFS=: read -r port expire_date; do
+            if [ "$expire_date" != "永久" ] && [ "$expire_date" -le "$current_date" ]; then
+                ((expired_count++))
+            fi
+        done < "$expires_path"
+    fi
+    
+    echo "$expired_count"
+}
+
+format_expire_date() {
+    local expire_timestamp=$1
+    if [ "$expire_timestamp" = "永久" ]; then
+        echo "永久"
+    else
+        local current=$(date +%s)
+        local seconds_left=$((expire_timestamp - current))
+        
+        if [ "$seconds_left" -lt 0 ]; then
+            echo "已过期"
+        elif [ "$seconds_left" -lt 3600 ]; then
+            echo "$((seconds_left / 60))分钟后"
+        elif [ "$seconds_left" -lt 86400 ]; then
+            echo "$((seconds_left / 3600))小时后"
+        else
+            echo "$((seconds_left / 86400))天后"
+        fi
+    fi
+}
+
+get_system_info() {
+    if command -v gost >/dev/null 2>&1; then
+        gost_status=$(systemctl is-active gost 2>/dev/null || echo "未运行")
+        gost_version=$(gost -V 2>/dev/null | awk '{print $2}' || echo "未知")
+    else
+        gost_status="未安装"
+        gost_version="未安装"
+    fi
+    
+    active_rules=$(wc -l < "$raw_conf_path" 2>/dev/null || echo "0")
+    expired_rules=$(check_expired_rules)
+    
+    total_traffic=0
+    if [ -f "$traffic_path" ]; then
+        while IFS=: read -r port total rest; do
+            total_traffic=$((total_traffic + total))
+        done < "$traffic_path"
+    fi
+    
+    echo -e "${Info} 服务状态: ${gost_status} | 版本: ${gost_version} | 总流量: $(format_bytes $total_traffic)"
+    echo -e "${Info} 活跃规则: ${active_rules} | 过期规则: ${expired_rules}"
+    echo
+}
+
+show_forwards_list() {
+    echo -e "${Blue_font_prefix}================================ 转发规则列表 ================================${Font_color_suffix}"
+    if [ ! -f "$raw_conf_path" ] || [ ! -s "$raw_conf_path" ]; then
+        echo -e "${Warning} 暂无转发规则"
+        echo
+        return
+    fi
+
+    printf "${Green_font_prefix}%-4s %-8s %-20s %-10s %-12s %-10s${Font_color_suffix}\n" \
+        "ID" "端口" "目标地址" "备注" "到期时间" "今日流量"
+    echo -e "${Blue_font_prefix}------------------------------------------------------------------------------${Font_color_suffix}"
+    
+    local id=1
+    while IFS= read -r line; do
+        local port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
+        local target=$(echo "$line" | cut -d'#' -f2)
+        local target_port=$(echo "$line" | cut -d'#' -f3)
+        local remark=$(grep "^${port}:" "$remarks_path" 2>/dev/null | cut -d':' -f2- || echo "无")
+        local expire_info=$(grep "^${port}:" "$expires_path" 2>/dev/null | cut -d':' -f2- || echo "永久")
+        local expire_display=$(format_expire_date "$expire_info")
+        
+        local traffic_info=$(get_port_traffic "$port")
+        local today_traffic=$(echo "$traffic_info" | cut -d: -f1)
+        local today_display=$(format_bytes "$today_traffic")
+        
+        [ ${#remark} -gt 8 ] && remark="${remark:0:8}.."
+        [ ${#target} -gt 12 ] && target_display="${target:0:10}.." || target_display="$target"
+        
+        if [ "$expire_display" = "已过期" ]; then
+            expire_color="${Red_font_prefix}"
+        elif [[ "$expire_display" == *"小时后"* ]] || [[ "$expire_display" == *"分钟后"* ]]; then
+            expire_color="${Yellow_font_prefix}"
+        else
+            expire_color=""
+        fi
+        
+        printf "%-4s %-8s %-20s %-10s ${expire_color}%-12s${Font_color_suffix} %-10s\n" \
+            "$id" "$port" "${target_display}:${target_port}" "$remark" "$expire_display" "$today_display"
+        
+        ((id++))
+    done < "$raw_conf_path"
+    echo
+}
+
+add_forward_rule() {
+    echo -e "${Info} 添加TCP+UDP转发规则"
+    read -p "本地监听端口: " local_port
+    read -p "目标IP地址: " target_ip  
+    read -p "目标端口: " target_port
+    read -p "备注信息 (可选): " remark
+    
+    echo -e "${Info} 设置到期时间:"
+    echo "1) 永久有效"
+    echo "2) 自定义小时数"
+    echo "3) 自定义天数"
+    read -p "请选择 [1-3]: " expire_choice
+    
+    local expire_timestamp="永久"
+    case $expire_choice in
+        2)
+            read -p "请输入有效小时数: " hours
+            if [[ $hours =~ ^[0-9]+$ ]] && [ "$hours" -gt 0 ]; then
+                expire_timestamp=$(date -d "+${hours} hours" +%s)
+                echo -e "${Info} 规则将在 ${hours} 小时后到期"
+            else
+                echo -e "${Warning} 小时数格式错误，设置为永久有效"
+                expire_timestamp="永久"
+            fi
+            ;;
+        3)
+            read -p "请输入有效天数: " days
+            if [[ $days =~ ^[0-9]+$ ]] && [ "$days" -gt 0 ]; then
+                expire_timestamp=$(date -d "+${days} days" +%s)
+                echo -e "${Info} 规则将在 ${days} 天后到期"
+            else
+                echo -e "${Warning} 天数格式错误，设置为永久有效"
+                expire_timestamp="永久"
+            fi
+            ;;
+        *)
+            expire_timestamp="永久"
+            ;;
+    esac
+    
+    if [[ ! $local_port =~ ^[0-9]+$ ]] || [[ ! $target_port =~ ^[0-9]+$ ]]; then
+        echo -e "${Error} 端口必须为数字"
+        sleep 2
+        return
+    fi
+    
+    if grep -q "/${local_port}#" "$raw_conf_path" 2>/dev/null; then
+        echo -e "${Error} 端口 $local_port 已被使用"
+        sleep 2
+        return
+    fi
+    
+    echo "nonencrypt/${local_port}#${target_ip}#${target_port}" >> "$raw_conf_path"
+    [ -n "$remark" ] && echo "${local_port}:${remark}" >> "$remarks_path"
+    echo "${local_port}:${expire_timestamp}" >> "$expires_path"
+    
+    setup_iptables_for_port "$local_port"
+    
+    rebuild_config
+    echo -e "${Info} 转发规则已添加"
+    echo -e "${Info} 端口: ${local_port} -> ${target_ip}:${target_port}"
+    echo -e "${Info} 备注: ${remark:-无}"
+    echo -e "${Info} 到期: $(format_expire_date "$expire_timestamp")"
+    sleep 2
+}
+
+delete_forward_rule() {
+    if [ ! -f "$raw_conf_path" ] || [ ! -s "$raw_conf_path" ]; then
+        echo -e "${Warning} 暂无转发规则"
+        sleep 2
+        return
+    fi
+    
+    read -p "请输入要删除的规则ID: " rule_id
+    
+    if ! [[ $rule_id =~ ^[0-9]+$ ]] || [ "$rule_id" -lt 1 ]; then
+        echo -e "${Error} 无效的规则ID"
+        sleep 2
+        return
+    fi
+    
+    local line=$(sed -n "${rule_id}p" "$raw_conf_path")
+    if [ -z "$line" ]; then
+        echo -e "${Error} 规则ID不存在"
+        sleep 2
+        return
+    fi
+    
+    local port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
+    
+    sed -i "${rule_id}d" "$raw_conf_path"
+    sed -i "/^${port}:/d" "$remarks_path" 2>/dev/null
+    sed -i "/^${port}:/d" "$expires_path" 2>/dev/null
+    sed -i "/^${port}:/d" "$traffic_path" 2>/dev/null
+    
+    remove_iptables_for_port "$port"
+    
+    rebuild_config
+    echo -e "${Info} 规则已删除 (端口: ${port})"
+    sleep 2
+}
+
+rebuild_config() {
+    if [ ! -f "$raw_conf_path" ] || [ ! -s "$raw_conf_path" ]; then
+        echo '{"Debug":false,"Retries":0,"ServeNodes":[]}' > "$gost_conf_path"
+    else
+        echo '{"Debug":false,"Retries":0,"ServeNodes":[' > "$gost_conf_path"
+        local count_line=$(wc -l < "$raw_conf_path")
+        local i=1
+        
+        while IFS= read -r line; do
+            local port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
+            local target=$(echo "$line" | cut -d'#' -f2)
+            local target_port=$(echo "$line" | cut -d'#' -f3)
+            
+            printf '        "tcp://:'"$port"'/'"$target"':'"$target_port"'","udp://:'"$port"'/'"$target"':'"$target_port"'"' >> "$gost_conf_path"
             
             if [ "$i" -lt "$count_line" ]; then
                 echo "," >> "$gost_conf_path"
@@ -186,14 +595,12 @@ show_traffic_details() {
     while IFS= read -r line; do
         local port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
         
-        # 获取流量信息
         local traffic_data=$(grep "^$port:" "$traffic_path" 2>/dev/null)
         if [ -n "$traffic_data" ]; then
             local total=$(echo "$traffic_data" | cut -d: -f2)
             local today=$(echo "$traffic_data" | cut -d: -f3)
             local month=$(echo "$traffic_data" | cut -d: -f4)
             
-            # 获取实时速率
             local traffic_info=$(get_port_traffic "$port")
             local speed=$(echo "$traffic_info" | cut -d: -f3)
             
@@ -225,7 +632,6 @@ show_traffic_details() {
 manage_forwards() {
     while true; do
         show_header
-        # 先检查并清理过期规则
         /usr/local/bin/gost-expire-check.sh 2>/dev/null
         show_forwards_list
         echo -e "${Green_font_prefix}=================== 转发管理 ===================${Font_color_suffix}"
@@ -254,7 +660,6 @@ manage_forwards() {
                 ;;
             5) 
                 systemctl restart gost && echo -e "${Info} 服务已重启"
-                # 重新初始化iptables规则
                 if [ -f "$raw_conf_path" ] && [ -s "$raw_conf_path" ]; then
                     while IFS= read -r line; do
                         port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
@@ -366,7 +771,6 @@ system_management() {
                 echo -e "${Info} 规则文件: $raw_conf_path"
                 echo -e "${Info} 流量数据: $traffic_path"
                 
-                # 显示定时任务状态
                 if [ -f /etc/cron.d/gost-expire ]; then
                     echo -e "${Info} 定时任务: 已配置"
                     echo -e "  - 到期检查: 每小时执行"
@@ -421,7 +825,6 @@ system_management() {
                     systemctl stop gost 2>/dev/null
                     systemctl disable gost 2>/dev/null
                     
-                    # 清理iptables规则
                     if [ -f "$raw_conf_path" ] && [ -s "$raw_conf_path" ]; then
                         while IFS= read -r line; do
                             port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
@@ -494,7 +897,6 @@ main() {
                     create_shortcut
                 fi
                 init_config
-                # 立即执行一次到期检查
                 /usr/local/bin/gost-expire-check.sh 2>/dev/null
                 main_menu
             fi
@@ -503,465 +905,4 @@ main() {
 }
 
 # 执行主函数
-main "$@"\"" >> "$GOST_CONF"
-            
-            if [ "$i" -lt "$count_line" ]; then
-                echo "," >> "$GOST_CONF"
-            else
-                echo "" >> "$GOST_CONF"
-            fi
-            ((i++))
-        done < "$RAW_CONF"
-        
-        echo "    ]" >> "$GOST_CONF"
-        echo "}" >> "$GOST_CONF"
-    fi
-    
-    systemctl restart gost >/dev/null 2>&1
-fi
-EOF
-    chmod +x /usr/local/bin/gost-expire-check.sh
-}
-
-create_traffic_monitor_script() {
-    cat > /usr/local/bin/gost-traffic-monitor.sh << 'EOF'
-#!/bin/bash
-# 流量统计脚本
-
-TRAFFIC_DB="/etc/gost/traffic.db"
-TRAFFIC_HISTORY="/etc/gost/traffic_history.db"
-RAW_CONF="/etc/gost/rawconf"
-
-[ ! -f "$RAW_CONF" ] && exit 0
-
-# 创建流量数据文件
-touch "$TRAFFIC_DB" "$TRAFFIC_HISTORY"
-
-# 获取当前时间戳
-current_time=$(date +%s)
-today=$(date +%Y%m%d)
-month=$(date +%Y%m)
-
-# 读取所有端口的流量
-while IFS= read -r line; do
-    port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
-    
-    # 获取iptables流量统计
-    tcp_bytes=$(iptables -t mangle -nvxL GOST_$port 2>/dev/null | awk '/ACCEPT/{sum+=$2}END{print sum+0}')
-    udp_bytes=$(iptables -t mangle -nvxL GOST_$port 2>/dev/null | awk '/ACCEPT.*udp/{sum+=$2}END{print sum+0}')
-    total_bytes=$((tcp_bytes + udp_bytes))
-    
-    # 读取历史数据
-    old_data=$(grep "^$port:" "$TRAFFIC_DB" 2>/dev/null)
-    if [ -n "$old_data" ]; then
-        old_total=$(echo "$old_data" | cut -d: -f2)
-        old_today=$(echo "$old_data" | cut -d: -f3)
-        old_month=$(echo "$old_data" | cut -d: -f4)
-        old_date=$(echo "$old_data" | cut -d: -f5)
-        old_month_date=$(echo "$old_data" | cut -d: -f6)
-        
-        # 检查是否需要重置日流量
-        if [ "$old_date" != "$today" ]; then
-            old_today=0
-        fi
-        
-        # 检查是否需要重置月流量
-        if [ "$old_month_date" != "$month" ]; then
-            old_month=0
-        fi
-        
-        # 计算增量
-        if [ "$total_bytes" -ge "$old_total" ]; then
-            increment=$((total_bytes - old_total))
-        else
-            # iptables计数器可能被重置
-            increment=$total_bytes
-        fi
-        
-        new_today=$((old_today + increment))
-        new_month=$((old_month + increment))
-        
-        # 更新数据
-        sed -i "/^$port:/d" "$TRAFFIC_DB"
-        echo "$port:$total_bytes:$new_today:$new_month:$today:$month:$current_time" >> "$TRAFFIC_DB"
-    else
-        # 新端口
-        echo "$port:$total_bytes:$total_bytes:$total_bytes:$today:$month:$current_time" >> "$TRAFFIC_DB"
-    fi
-done < "$RAW_CONF"
-
-# 保存历史记录
-cp "$TRAFFIC_DB" "$TRAFFIC_HISTORY.$(date +%Y%m%d%H%M)"
-# 只保留最近100个历史文件
-ls -t "$TRAFFIC_HISTORY".* 2>/dev/null | tail -n +101 | xargs rm -f 2>/dev/null
-EOF
-    chmod +x /usr/local/bin/gost-traffic-monitor.sh
-    
-    # 创建流量重置脚本
-    cat > /usr/local/bin/gost-traffic-reset.sh << 'EOF'
-#!/bin/bash
-# 流量重置脚本
-
-TRAFFIC_DB="/etc/gost/traffic.db"
-reset_type="$1"
-
-if [ "$reset_type" = "daily" ]; then
-    # 重置日流量
-    while IFS=: read -r port total today month date month_date time; do
-        echo "$port:$total:0:$month:$(date +%Y%m%d):$month_date:$time"
-    done < "$TRAFFIC_DB" > "$TRAFFIC_DB.tmp"
-    mv "$TRAFFIC_DB.tmp" "$TRAFFIC_DB"
-elif [ "$reset_type" = "monthly" ]; then
-    # 重置月流量
-    while IFS=: read -r port total today month date month_date time; do
-        echo "$port:$total:$today:0:$date:$(date +%Y%m):$time"
-    done < "$TRAFFIC_DB" > "$TRAFFIC_DB.tmp"
-    mv "$TRAFFIC_DB.tmp" "$TRAFFIC_DB"
-fi
-EOF
-    chmod +x /usr/local/bin/gost-traffic-reset.sh
-}
-
-setup_iptables_for_port() {
-    local port=$1
-    
-    # 创建专用链用于流量统计
-    iptables -t mangle -N GOST_$port 2>/dev/null
-    
-    # 添加规则到PREROUTING链
-    iptables -t mangle -C PREROUTING -p tcp --dport $port -j GOST_$port 2>/dev/null || \
-        iptables -t mangle -A PREROUTING -p tcp --dport $port -j GOST_$port
-    iptables -t mangle -C PREROUTING -p udp --dport $port -j GOST_$port 2>/dev/null || \
-        iptables -t mangle -A PREROUTING -p udp --dport $port -j GOST_$port
-    
-    # 在专用链中添加ACCEPT规则用于计数
-    iptables -t mangle -C GOST_$port -j ACCEPT 2>/dev/null || \
-        iptables -t mangle -A GOST_$port -j ACCEPT
-}
-
-remove_iptables_for_port() {
-    local port=$1
-    
-    # 删除PREROUTING链中的规则
-    iptables -t mangle -D PREROUTING -p tcp --dport $port -j GOST_$port 2>/dev/null
-    iptables -t mangle -D PREROUTING -p udp --dport $port -j GOST_$port 2>/dev/null
-    
-    # 删除专用链
-    iptables -t mangle -F GOST_$port 2>/dev/null
-    iptables -t mangle -X GOST_$port 2>/dev/null
-}
-
-format_bytes() {
-    local bytes=$1
-    if [ "$bytes" -lt 1024 ]; then
-        echo "${bytes}B"
-    elif [ "$bytes" -lt 1048576 ]; then
-        echo "$(echo "scale=2; $bytes/1024" | bc)KB"
-    elif [ "$bytes" -lt 1073741824 ]; then
-        echo "$(echo "scale=2; $bytes/1048576" | bc)MB"
-    else
-        echo "$(echo "scale=2; $bytes/1073741824" | bc)GB"
-    fi
-}
-
-get_port_traffic() {
-    local port=$1
-    local traffic_data=$(grep "^$port:" "$traffic_path" 2>/dev/null)
-    
-    if [ -n "$traffic_data" ]; then
-        local today=$(echo "$traffic_data" | cut -d: -f3)
-        local month=$(echo "$traffic_data" | cut -d: -f4)
-        local last_update=$(echo "$traffic_data" | cut -d: -f7)
-        
-        # 计算速率 (最近5分钟的平均速率)
-        local current_time=$(date +%s)
-        local time_diff=$((current_time - last_update))
-        if [ "$time_diff" -gt 0 ] && [ "$time_diff" -lt 600 ]; then
-            local current_bytes=$(iptables -t mangle -nvxL GOST_$port 2>/dev/null | awk '/ACCEPT/{sum+=$2}END{print sum+0}')
-            local old_bytes=$(echo "$traffic_data" | cut -d: -f2)
-            local bytes_diff=$((current_bytes - old_bytes))
-            if [ "$bytes_diff" -lt 0 ]; then bytes_diff=0; fi
-            local speed=$((bytes_diff / time_diff))
-        else
-            local speed=0
-        fi
-        
-        echo "$today:$month:$speed"
-    else
-        echo "0:0:0"
-    fi
-}
-
-create_shortcut() {
-    echo -e "${Info} 创建快捷命令..."
-    
-    if is_oneclick_install; then
-        # 在线安装模式
-        if wget -q -O /usr/local/bin/gost-manager.sh "https://raw.githubusercontent.com/xmg0828-01/gost/main/gost.sh"; then
-            chmod +x /usr/local/bin/gost-manager.sh
-        else
-            cat > /usr/local/bin/gost-manager.sh << 'EOF'
-#!/bin/bash
-bash <(curl -sSL https://raw.githubusercontent.com/xmg0828-01/gost/main/gost.sh) --menu
-EOF
-            chmod +x /usr/local/bin/gost-manager.sh
-        fi
-    else
-        # 本地安装模式
-        cp "$0" /usr/local/bin/gost-manager.sh
-        chmod +x /usr/local/bin/gost-manager.sh
-    fi
-    
-    ln -sf /usr/local/bin/gost-manager.sh /usr/bin/g
-    echo -e "${Info} 快捷命令 'g' 创建成功"
-}
-
-init_config() {
-    mkdir -p /etc/gost
-    touch /etc/gost/{rawconf,remarks.txt,expires.txt,traffic.db,traffic_history.db}
-    [ ! -f "$gost_conf_path" ] && echo '{"Debug":false,"Retries":0,"ServeNodes":[]}' > "$gost_conf_path"
-    
-    # 初始化已有端口的iptables规则
-    if [ -f "$raw_conf_path" ] && [ -s "$raw_conf_path" ]; then
-        while IFS= read -r line; do
-            port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
-            setup_iptables_for_port "$port"
-        done < "$raw_conf_path"
-    fi
-}
-
-show_header() {
-    clear
-    echo -e "${Blue_font_prefix}======================================================${Font_color_suffix}"
-    echo -e "${Green_font_prefix}          GOST 增强版管理面板 v${shell_version}${Font_color_suffix}"
-    echo -e "${Blue_font_prefix}======================================================${Font_color_suffix}"
-    echo -e "${Yellow_font_prefix}功能: 转发管理 | 到期时间 | 流量统计 | 备注信息${Font_color_suffix}"
-    echo -e "${Blue_font_prefix}======================================================${Font_color_suffix}"
-    echo
-}
-
-check_expired_rules() {
-    local expired_count=0
-    local current_date=$(date +%s)
-    
-    if [ -f "$expires_path" ]; then
-        while IFS=: read -r port expire_date; do
-            if [ "$expire_date" != "永久" ] && [ "$expire_date" -le "$current_date" ]; then
-                ((expired_count++))
-            fi
-        done < "$expires_path"
-    fi
-    
-    echo "$expired_count"
-}
-
-format_expire_date() {
-    local expire_timestamp=$1
-    if [ "$expire_timestamp" = "永久" ]; then
-        echo "永久"
-    else
-        local current=$(date +%s)
-        local seconds_left=$((expire_timestamp - current))
-        
-        if [ "$seconds_left" -lt 0 ]; then
-            echo "已过期"
-        elif [ "$seconds_left" -lt 3600 ]; then
-            echo "$((seconds_left / 60))分钟后"
-        elif [ "$seconds_left" -lt 86400 ]; then
-            echo "$((seconds_left / 3600))小时后"
-        else
-            echo "$((seconds_left / 86400))天后"
-        fi
-    fi
-}
-
-get_system_info() {
-    if command -v gost >/dev/null 2>&1; then
-        gost_status=$(systemctl is-active gost 2>/dev/null || echo "未运行")
-        gost_version=$(gost -V 2>/dev/null | awk '{print $2}' || echo "未知")
-    else
-        gost_status="未安装"
-        gost_version="未安装"
-    fi
-    
-    active_rules=$(wc -l < "$raw_conf_path" 2>/dev/null || echo "0")
-    expired_rules=$(check_expired_rules)
-    
-    # 计算总流量
-    total_traffic=0
-    if [ -f "$traffic_path" ]; then
-        while IFS=: read -r port total rest; do
-            total_traffic=$((total_traffic + total))
-        done < "$traffic_path"
-    fi
-    
-    echo -e "${Info} 服务状态: ${gost_status} | 版本: ${gost_version} | 总流量: $(format_bytes $total_traffic)"
-    echo -e "${Info} 活跃规则: ${active_rules} | 过期规则: ${expired_rules}"
-    echo
-}
-
-show_forwards_list() {
-    echo -e "${Blue_font_prefix}================================ 转发规则列表 ================================${Font_color_suffix}"
-    if [ ! -f "$raw_conf_path" ] || [ ! -s "$raw_conf_path" ]; then
-        echo -e "${Warning} 暂无转发规则"
-        echo
-        return
-    fi
-
-    printf "${Green_font_prefix}%-4s %-8s %-20s %-10s %-12s %-10s${Font_color_suffix}\n" \
-        "ID" "端口" "目标地址" "备注" "到期时间" "今日流量"
-    echo -e "${Blue_font_prefix}------------------------------------------------------------------------------${Font_color_suffix}"
-    
-    local id=1
-    while IFS= read -r line; do
-        local port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
-        local target=$(echo "$line" | cut -d'#' -f2)
-        local target_port=$(echo "$line" | cut -d'#' -f3)
-        local remark=$(grep "^${port}:" "$remarks_path" 2>/dev/null | cut -d':' -f2- || echo "无")
-        local expire_info=$(grep "^${port}:" "$expires_path" 2>/dev/null | cut -d':' -f2- || echo "永久")
-        local expire_display=$(format_expire_date "$expire_info")
-        
-        # 获取流量信息
-        local traffic_info=$(get_port_traffic "$port")
-        local today_traffic=$(echo "$traffic_info" | cut -d: -f1)
-        local today_display=$(format_bytes "$today_traffic")
-        
-        # 截断过长的内容
-        [ ${#remark} -gt 8 ] && remark="${remark:0:8}.."
-        [ ${#target} -gt 12 ] && target_display="${target:0:10}.." || target_display="$target"
-        
-        # 根据到期状态设置颜色
-        if [ "$expire_display" = "已过期" ]; then
-            expire_color="${Red_font_prefix}"
-        elif [[ "$expire_display" == *"小时后"* ]] || [[ "$expire_display" == *"分钟后"* ]]; then
-            expire_color="${Yellow_font_prefix}"
-        else
-            expire_color=""
-        fi
-        
-        printf "%-4s %-8s %-20s %-10s ${expire_color}%-12s${Font_color_suffix} %-10s\n" \
-            "$id" "$port" "${target_display}:${target_port}" "$remark" "$expire_display" "$today_display"
-        
-        ((id++))
-    done < "$raw_conf_path"
-    echo
-}
-
-add_forward_rule() {
-    echo -e "${Info} 添加TCP+UDP转发规则"
-    read -p "本地监听端口: " local_port
-    read -p "目标IP地址: " target_ip  
-    read -p "目标端口: " target_port
-    read -p "备注信息 (可选): " remark
-    
-    echo -e "${Info} 设置到期时间:"
-    echo "1) 永久有效"
-    echo "2) 自定义小时数"
-    echo "3) 自定义天数"
-    read -p "请选择 [1-3]: " expire_choice
-    
-    local expire_timestamp="永久"
-    case $expire_choice in
-        2)
-            read -p "请输入有效小时数: " hours
-            if [[ $hours =~ ^[0-9]+$ ]] && [ "$hours" -gt 0 ]; then
-                expire_timestamp=$(date -d "+${hours} hours" +%s)
-                echo -e "${Info} 规则将在 ${hours} 小时后到期"
-            else
-                echo -e "${Warning} 小时数格式错误，设置为永久有效"
-                expire_timestamp="永久"
-            fi
-            ;;
-        3)
-            read -p "请输入有效天数: " days
-            if [[ $days =~ ^[0-9]+$ ]] && [ "$days" -gt 0 ]; then
-                expire_timestamp=$(date -d "+${days} days" +%s)
-                echo -e "${Info} 规则将在 ${days} 天后到期"
-            else
-                echo -e "${Warning} 天数格式错误，设置为永久有效"
-                expire_timestamp="永久"
-            fi
-            ;;
-        *)
-            expire_timestamp="永久"
-            ;;
-    esac
-    
-    if [[ ! $local_port =~ ^[0-9]+$ ]] || [[ ! $target_port =~ ^[0-9]+$ ]]; then
-        echo -e "${Error} 端口必须为数字"
-        sleep 2
-        return
-    fi
-    
-    if grep -q "/${local_port}#" "$raw_conf_path" 2>/dev/null; then
-        echo -e "${Error} 端口 $local_port 已被使用"
-        sleep 2
-        return
-    fi
-    
-    echo "nonencrypt/${local_port}#${target_ip}#${target_port}" >> "$raw_conf_path"
-    [ -n "$remark" ] && echo "${local_port}:${remark}" >> "$remarks_path"
-    echo "${local_port}:${expire_timestamp}" >> "$expires_path"
-    
-    # 设置iptables规则用于流量统计
-    setup_iptables_for_port "$local_port"
-    
-    rebuild_config
-    echo -e "${Info} 转发规则已添加"
-    echo -e "${Info} 端口: ${local_port} -> ${target_ip}:${target_port}"
-    echo -e "${Info} 备注: ${remark:-无}"
-    echo -e "${Info} 到期: $(format_expire_date "$expire_timestamp")"
-    sleep 2
-}
-
-delete_forward_rule() {
-    if [ ! -f "$raw_conf_path" ] || [ ! -s "$raw_conf_path" ]; then
-        echo -e "${Warning} 暂无转发规则"
-        sleep 2
-        return
-    fi
-    
-    read -p "请输入要删除的规则ID: " rule_id
-    
-    if ! [[ $rule_id =~ ^[0-9]+$ ]] || [ "$rule_id" -lt 1 ]; then
-        echo -e "${Error} 无效的规则ID"
-        sleep 2
-        return
-    fi
-    
-    local line=$(sed -n "${rule_id}p" "$raw_conf_path")
-    if [ -z "$line" ]; then
-        echo -e "${Error} 规则ID不存在"
-        sleep 2
-        return
-    fi
-    
-    local port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
-    
-    sed -i "${rule_id}d" "$raw_conf_path"
-    sed -i "/^${port}:/d" "$remarks_path" 2>/dev/null
-    sed -i "/^${port}:/d" "$expires_path" 2>/dev/null
-    sed -i "/^${port}:/d" "$traffic_path" 2>/dev/null
-    
-    # 清理iptables规则
-    remove_iptables_for_port "$port"
-    
-    rebuild_config
-    echo -e "${Info} 规则已删除 (端口: ${port})"
-    sleep 2
-}
-
-rebuild_config() {
-    if [ ! -f "$raw_conf_path" ] || [ ! -s "$raw_conf_path" ]; then
-        echo '{"Debug":false,"Retries":0,"ServeNodes":[]}' > "$gost_conf_path"
-    else
-        echo '{"Debug":false,"Retries":0,"ServeNodes":[' > "$gost_conf_path"
-        local count_line=$(wc -l < "$raw_conf_path")
-        local i=1
-        
-        while IFS= read -r line; do
-            local port=$(echo "$line" | cut -d'/' -f2 | cut -d'#' -f1)
-            local target=$(echo "$line" | cut -d'#' -f2)
-            local target_port=$(echo "$line" | cut -d'#' -f3)
-            
-            echo -n "        \"tcp://:$port/$target:$target_port\",\"udp://:$port/$target:$target_port
+main "$@"
