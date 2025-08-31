@@ -1,6 +1,6 @@
 #!/bin/bash
-# GOST管理脚本 v3.2 - 最终修复版
-# 修复: g命令、GOST 3.x版本、流量统计、到期时间
+# GOST管理脚本 - 兼容2.x和3.x版本
+# 自动检测版本并使用正确的配置格式
 
 # 颜色定义
 RED="\033[31m"
@@ -10,8 +10,8 @@ BLUE="\033[34m"
 PLAIN="\033[0m"
 
 # 版本信息
-SCRIPT_VERSION="3.2"
-GOST_VERSION="3.0.0-rc10"  # 使用GOST 3.x最新版本
+SCRIPT_VERSION="3.3"
+GOST_VERSION="2.11.5"  # 默认使用稳定的2.11.5版本
 
 # 配置路径
 CONFIG_DIR="/etc/gost"
@@ -52,6 +52,20 @@ check_system() {
     fi
 }
 
+# 检测GOST版本
+get_gost_version() {
+    if [[ -f /usr/bin/gost ]]; then
+        local version=$(/usr/bin/gost -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+        if [[ -n ${version} ]]; then
+            echo "${version}"
+        else
+            echo "2.11"
+        fi
+    else
+        echo "0"
+    fi
+}
+
 # 安装依赖
 install_deps() {
     echo -e "${GREEN}安装依赖包...${PLAIN}"
@@ -63,41 +77,29 @@ install_deps() {
     fi
 }
 
-# 下载并安装GOST 3.x
+# 安装GOST 2.11.5 (稳定版本)
 install_gost() {
-    echo -e "${GREEN}开始安装GOST 3.x...${PLAIN}"
+    echo -e "${GREEN}开始安装GOST ${GOST_VERSION}...${PLAIN}"
     
     # 停止旧服务
     systemctl stop gost >/dev/null 2>&1
     
-    # 下载GOST 3.x
+    # 下载GOST 2.11.5
     cd /tmp
-    DOWNLOAD_URL="https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_${ARCH}.tar.gz"
+    DOWNLOAD_URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-${ARCH}-${GOST_VERSION}.gz"
     
     echo -e "${GREEN}下载GOST ${GOST_VERSION}...${PLAIN}"
-    if ! wget --no-check-certificate -q --show-progress --timeout=30 -O gost.tar.gz "${DOWNLOAD_URL}"; then
+    if ! wget --no-check-certificate -q --show-progress --timeout=30 -O gost.gz "${DOWNLOAD_URL}"; then
         echo -e "${YELLOW}Github下载失败，尝试镜像源...${PLAIN}"
         MIRROR_URL="https://ghproxy.com/${DOWNLOAD_URL}"
-        if ! wget --no-check-certificate -q --show-progress --timeout=30 -O gost.tar.gz "${MIRROR_URL}"; then
-            echo -e "${YELLOW}GOST 3.x下载失败，使用2.11.5版本${PLAIN}"
-            # 回退到2.11.5版本
-            GOST_VERSION="2.11.5"
-            DOWNLOAD_URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-${ARCH}-${GOST_VERSION}.gz"
-            if ! wget --no-check-certificate -q --show-progress --timeout=30 -O gost.gz "${DOWNLOAD_URL}"; then
-                echo -e "${RED}下载失败${PLAIN}"
-                exit 1
-            fi
-            gunzip -f gost.gz
-            chmod +x gost
-        else
-            tar -xzf gost.tar.gz
-            chmod +x gost
+        if ! wget --no-check-certificate -q --show-progress --timeout=30 -O gost.gz "${MIRROR_URL}"; then
+            echo -e "${RED}下载失败${PLAIN}"
+            exit 1
         fi
-    else
-        tar -xzf gost.tar.gz
-        chmod +x gost
     fi
     
+    gunzip -f gost.gz
+    chmod +x gost
     mv -f gost /usr/bin/gost
     
     # 创建配置目录
@@ -132,12 +134,18 @@ EOF
     systemctl start gost
     
     # 创建定时任务检查过期
+    create_expire_check_script
+    
+    echo -e "${GREEN}GOST安装完成${PLAIN}"
+}
+
+# 创建过期检查脚本
+create_expire_check_script() {
     cat > /usr/local/bin/check-gost-expire.sh <<'EXPIRE_SCRIPT'
 #!/bin/bash
 CONFIG_DIR="/etc/gost"
 RAW_CONFIG="${CONFIG_DIR}/rawconf"
 EXPIRES_FILE="${CONFIG_DIR}/expires.txt"
-GOST_CONFIG="${CONFIG_DIR}/config.json"
 
 current_time=$(date +%s)
 need_rebuild=false
@@ -161,36 +169,16 @@ if [[ -f ${EXPIRES_FILE} ]]; then
 fi
 
 if [[ ${need_rebuild} == true ]]; then
-    # 重建配置
-    if [[ ! -s ${RAW_CONFIG} ]]; then
-        echo '{"Debug":false,"Retries":0,"ServeNodes":[]}' > ${GOST_CONFIG}
-    else
-        echo '{"Debug":false,"Retries":0,"ServeNodes":[' > ${GOST_CONFIG}
-        first=true
-        while IFS= read -r line; do
-            port=$(echo "${line}" | cut -d'/' -f2 | cut -d'#' -f1)
-            target=$(echo "${line}" | cut -d'#' -f2)
-            target_port=$(echo "${line}" | cut -d'#' -f3)
-            
-            [[ ${first} == false ]] && echo "," >> ${GOST_CONFIG}
-            echo -n "\"tcp://:${port}/${target}:${target_port}\",\"udp://:${port}/${target}:${target_port}\"" >> ${GOST_CONFIG}
-            first=false
-        done < ${RAW_CONFIG}
-        echo "" >> ${GOST_CONFIG}
-        echo "]}" >> ${GOST_CONFIG}
-    fi
-    systemctl restart gost
+    /usr/local/bin/gost-manager --rebuild
 fi
 EXPIRE_SCRIPT
     chmod +x /usr/local/bin/check-gost-expire.sh
     
     # 添加cron任务 (每小时检查)
     echo "0 * * * * root /usr/local/bin/check-gost-expire.sh >/dev/null 2>&1" > /etc/cron.d/gost-expire
-    
-    echo -e "${GREEN}GOST安装完成${PLAIN}"
 }
 
-# 修复g命令 - 确保能正常工作
+# 修复g命令
 fix_g_command() {
     # 获取当前脚本的实际路径
     CURRENT_SCRIPT=$(readlink -f "$0")
@@ -199,7 +187,7 @@ fix_g_command() {
     cp -f "${CURRENT_SCRIPT}" /usr/local/bin/gost-manager
     chmod +x /usr/local/bin/gost-manager
     
-    # 创建g命令 - 直接指向脚本
+    # 创建g命令
     cat > /usr/bin/g <<'EOF'
 #!/bin/bash
 exec /usr/local/bin/gost-manager "$@"
@@ -314,32 +302,44 @@ format_expire_time() {
     fi
 }
 
-# 重建GOST配置
+# 重建GOST配置 - 兼容2.x版本格式
 rebuild_config() {
+    local gost_ver=$(get_gost_version)
+    
     if [[ ! -s ${RAW_CONFIG} ]]; then
         echo '{"Debug":false,"Retries":0,"ServeNodes":[]}' > ${GOST_CONFIG}
     else
-        echo '{"Debug":false,"Retries":0,"ServeNodes":[' > ${GOST_CONFIG}
-        
-        local first=true
-        while IFS= read -r line; do
-            local port=$(echo "${line}" | cut -d'/' -f2 | cut -d'#' -f1)
-            local target=$(echo "${line}" | cut -d'#' -f2)
-            local target_port=$(echo "${line}" | cut -d'#' -f3)
-            
-            if [[ ${first} == false ]]; then
-                echo "," >> ${GOST_CONFIG}
-            fi
-            first=false
-            
-            echo -n "\"tcp://:${port}/${target}:${target_port}\",\"udp://:${port}/${target}:${target_port}\"" >> ${GOST_CONFIG}
-        done < ${RAW_CONFIG}
-        
-        echo "" >> ${GOST_CONFIG}
-        echo "]}" >> ${GOST_CONFIG}
+        # GOST 2.x配置格式
+        {
+            echo '{"Debug":false,"Retries":0,"ServeNodes":['
+            local first=true
+            while IFS= read -r line; do
+                local port=$(echo "${line}" | cut -d'/' -f2 | cut -d'#' -f1)
+                local target=$(echo "${line}" | cut -d'#' -f2)
+                local target_port=$(echo "${line}" | cut -d'#' -f3)
+                
+                if [[ ${first} == false ]]; then
+                    echo ","
+                fi
+                first=false
+                
+                # GOST 2.x格式
+                echo -n "        \"tcp://:${port}/${target}:${target_port}\",\"udp://:${port}/${target}:${target_port}\""
+            done < ${RAW_CONFIG}
+            echo ""
+            echo "    ]"
+            echo "}"
+        } > ${GOST_CONFIG}
     fi
     
     systemctl restart gost >/dev/null 2>&1
+    
+    # 检查服务是否启动成功
+    sleep 2
+    if ! systemctl is-active gost >/dev/null 2>&1; then
+        echo -e "${RED}GOST服务启动失败，请检查配置${PLAIN}"
+        journalctl -u gost -n 20 --no-pager
+    fi
 }
 
 # 检查过期规则
@@ -594,11 +594,12 @@ show_traffic() {
         "$(format_bytes ${total_all})"
 }
 
-# 更新GOST到最新版本
-update_gost() {
-    echo -e "${GREEN}检查GOST最新版本...${PLAIN}"
-    install_gost
-    echo -e "${GREEN}更新完成${PLAIN}"
+# 查看GOST日志
+show_gost_log() {
+    echo -e "${GREEN}GOST服务日志 (最近50行):${PLAIN}"
+    echo -e "${BLUE}-----------------------------------------------------------${PLAIN}"
+    journalctl -u gost -n 50 --no-pager
+    echo -e "${BLUE}-----------------------------------------------------------${PLAIN}"
 }
 
 # 主菜单
@@ -613,13 +614,14 @@ main_menu() {
         echo -e "${GREEN}2.${PLAIN} 删除转发规则"
         echo -e "${GREEN}3.${PLAIN} 查看流量统计"
         echo -e "${GREEN}4.${PLAIN} 重启GOST服务"
-        echo -e "${GREEN}5.${PLAIN} 更新GOST版本"
+        echo -e "${GREEN}5.${PLAIN} 查看GOST日志"
         echo -e "${GREEN}6.${PLAIN} 修复g命令"
-        echo -e "${GREEN}7.${PLAIN} 卸载GOST"
+        echo -e "${GREEN}7.${PLAIN} 重新安装GOST"
+        echo -e "${GREEN}8.${PLAIN} 卸载GOST"
         echo -e "${GREEN}0.${PLAIN} 退出"
         echo
         
-        read -p "请选择 [0-7]: " choice
+        read -p "请选择 [0-8]: " choice
         
         case ${choice} in
             1)
@@ -639,12 +641,20 @@ main_menu() {
                 ;;
             4)
                 systemctl restart gost
-                echo -e "${GREEN}重启成功${PLAIN}"
+                sleep 1
+                if systemctl is-active gost >/dev/null 2>&1; then
+                    echo -e "${GREEN}重启成功${PLAIN}"
+                else
+                    echo -e "${RED}重启失败，查看日志...${PLAIN}"
+                    journalctl -u gost -n 20 --no-pager
+                fi
                 sleep 2
                 ;;
             5)
-                update_gost
-                sleep 2
+                clear
+                show_header
+                show_gost_log
+                read -p "按Enter继续..."
                 ;;
             6)
                 fix_g_command
@@ -652,6 +662,11 @@ main_menu() {
                 sleep 2
                 ;;
             7)
+                install_gost
+                init_iptables
+                sleep 2
+                ;;
+            8)
                 read -p "确定要卸载GOST吗？(y/n): " confirm
                 if [[ ${confirm} == "y" ]]; then
                     systemctl stop gost
@@ -664,9 +679,6 @@ main_menu() {
                     rm -f /etc/cron.d/gost-expire
                     
                     # 清理iptables
-                    iptables -t filter -F GOST 2>/dev/null
-                    iptables -t filter -X GOST 2>/dev/null
-                    
                     echo -e "${GREEN}卸载完成${PLAIN}"
                     exit 0
                 fi
@@ -687,6 +699,12 @@ main_menu() {
 main() {
     check_root
     check_system
+    
+    # 处理命令行参数
+    if [[ "$1" == "--rebuild" ]]; then
+        rebuild_config
+        exit 0
+    fi
     
     # 检查是否已安装
     if [[ ! -f /usr/bin/gost ]]; then
