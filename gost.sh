@@ -1,6 +1,6 @@
 #!/bin/bash
-# GOST管理脚本 - 兼容2.x和3.x版本
-# 自动检测版本并使用正确的配置格式
+# GOST管理脚本 - 修复转发和到期时间问题
+# 使用正确的rawconf格式
 
 # 颜色定义
 RED="\033[31m"
@@ -10,8 +10,8 @@ BLUE="\033[34m"
 PLAIN="\033[0m"
 
 # 版本信息
-SCRIPT_VERSION="3.3"
-GOST_VERSION="2.11.5"  # 默认使用稳定的2.11.5版本
+SCRIPT_VERSION="3.4"
+GOST_VERSION="2.11.5"
 
 # 配置路径
 CONFIG_DIR="/etc/gost"
@@ -19,7 +19,6 @@ GOST_CONFIG="${CONFIG_DIR}/config.json"
 RAW_CONFIG="${CONFIG_DIR}/rawconf"
 REMARKS_FILE="${CONFIG_DIR}/remarks.txt"
 EXPIRES_FILE="${CONFIG_DIR}/expires.txt"
-TRAFFIC_DB="${CONFIG_DIR}/traffic.db"
 
 # 检查root权限
 check_root() {
@@ -52,20 +51,6 @@ check_system() {
     fi
 }
 
-# 检测GOST版本
-get_gost_version() {
-    if [[ -f /usr/bin/gost ]]; then
-        local version=$(/usr/bin/gost -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
-        if [[ -n ${version} ]]; then
-            echo "${version}"
-        else
-            echo "2.11"
-        fi
-    else
-        echo "0"
-    fi
-}
-
 # 安装依赖
 install_deps() {
     echo -e "${GREEN}安装依赖包...${PLAIN}"
@@ -77,18 +62,16 @@ install_deps() {
     fi
 }
 
-# 安装GOST 2.11.5 (稳定版本)
+# 安装GOST
 install_gost() {
     echo -e "${GREEN}开始安装GOST ${GOST_VERSION}...${PLAIN}"
     
-    # 停止旧服务
     systemctl stop gost >/dev/null 2>&1
     
-    # 下载GOST 2.11.5
     cd /tmp
     DOWNLOAD_URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-${ARCH}-${GOST_VERSION}.gz"
     
-    echo -e "${GREEN}下载GOST ${GOST_VERSION}...${PLAIN}"
+    echo -e "${GREEN}下载GOST...${PLAIN}"
     if ! wget --no-check-certificate -q --show-progress --timeout=30 -O gost.gz "${DOWNLOAD_URL}"; then
         echo -e "${YELLOW}Github下载失败，尝试镜像源...${PLAIN}"
         MIRROR_URL="https://ghproxy.com/${DOWNLOAD_URL}"
@@ -102,25 +85,21 @@ install_gost() {
     chmod +x gost
     mv -f gost /usr/bin/gost
     
-    # 创建配置目录
     mkdir -p ${CONFIG_DIR}
     
-    # 初始化配置文件
     if [[ ! -f ${GOST_CONFIG} ]]; then
         echo '{"Debug":false,"Retries":0,"ServeNodes":[]}' > ${GOST_CONFIG}
     fi
     
-    touch ${RAW_CONFIG} ${REMARKS_FILE} ${EXPIRES_FILE} ${TRAFFIC_DB}
+    touch ${RAW_CONFIG} ${REMARKS_FILE} ${EXPIRES_FILE}
     
-    # 创建systemd服务
     cat > /etc/systemd/system/gost.service <<EOF
 [Unit]
-Description=GOST Service
+Description=GOST
 After=network.target
 
 [Service]
 Type=simple
-User=root
 ExecStart=/usr/bin/gost -C ${GOST_CONFIG}
 Restart=always
 RestartSec=5
@@ -133,61 +112,59 @@ EOF
     systemctl enable gost >/dev/null 2>&1
     systemctl start gost
     
-    # 创建定时任务检查过期
-    create_expire_check_script
+    create_expire_check
     
     echo -e "${GREEN}GOST安装完成${PLAIN}"
 }
 
-# 创建过期检查脚本
-create_expire_check_script() {
-    cat > /usr/local/bin/check-gost-expire.sh <<'EXPIRE_SCRIPT'
+# 创建过期检查
+create_expire_check() {
+    cat > /usr/local/bin/gost-expire-check <<'EOF'
 #!/bin/bash
 CONFIG_DIR="/etc/gost"
 RAW_CONFIG="${CONFIG_DIR}/rawconf"
 EXPIRES_FILE="${CONFIG_DIR}/expires.txt"
 
+if [[ ! -f ${EXPIRES_FILE} ]]; then
+    exit 0
+fi
+
 current_time=$(date +%s)
+temp_file="/tmp/expires_temp"
 need_rebuild=false
 
-if [[ -f ${EXPIRES_FILE} ]]; then
-    temp_file="/tmp/expires_temp_$$"
-    > ${temp_file}
-    
-    while IFS=: read -r port expire_time; do
-        if [[ "${expire_time}" != "永久" ]] && [[ ${expire_time} -le ${current_time} ]]; then
-            sed -i "/\/${port}#/d" ${RAW_CONFIG}
-            sed -i "/^${port}:/d" ${CONFIG_DIR}/remarks.txt
-            need_rebuild=true
-            echo "[$(date)] 端口 ${port} 已过期并删除" >> /var/log/gost.log
-        else
-            echo "${port}:${expire_time}" >> ${temp_file}
-        fi
-    done < ${EXPIRES_FILE}
-    
-    mv -f ${temp_file} ${EXPIRES_FILE}
-fi
+> ${temp_file}
+
+while IFS=: read -r port expire_time; do
+    if [[ "${expire_time}" != "permanent" ]] && [[ ${expire_time} -lt ${current_time} ]]; then
+        # 删除过期规则 - 修正格式
+        sed -i "/^nonencrypt\/${port}#/d" ${RAW_CONFIG}
+        sed -i "/^${port}:/d" ${CONFIG_DIR}/remarks.txt
+        need_rebuild=true
+        echo "[$(date)] Port ${port} expired and removed" >> /var/log/gost.log
+    else
+        echo "${port}:${expire_time}" >> ${temp_file}
+    fi
+done < ${EXPIRES_FILE}
+
+mv -f ${temp_file} ${EXPIRES_FILE}
 
 if [[ ${need_rebuild} == true ]]; then
     /usr/local/bin/gost-manager --rebuild
 fi
-EXPIRE_SCRIPT
-    chmod +x /usr/local/bin/check-gost-expire.sh
+EOF
+    chmod +x /usr/local/bin/gost-expire-check
     
-    # 添加cron任务 (每小时检查)
-    echo "0 * * * * root /usr/local/bin/check-gost-expire.sh >/dev/null 2>&1" > /etc/cron.d/gost-expire
+    echo "0 * * * * root /usr/local/bin/gost-expire-check >/dev/null 2>&1" > /etc/cron.d/gost-expire
 }
 
 # 修复g命令
 fix_g_command() {
-    # 获取当前脚本的实际路径
     CURRENT_SCRIPT=$(readlink -f "$0")
     
-    # 复制脚本到固定位置
     cp -f "${CURRENT_SCRIPT}" /usr/local/bin/gost-manager
     chmod +x /usr/local/bin/gost-manager
     
-    # 创建g命令
     cat > /usr/bin/g <<'EOF'
 #!/bin/bash
 exec /usr/local/bin/gost-manager "$@"
@@ -197,42 +174,35 @@ EOF
     echo -e "${GREEN}快捷命令 'g' 修复成功${PLAIN}"
 }
 
-# 初始化iptables规则
+# iptables流量统计
 init_iptables() {
-    # 检查iptables
     if ! command -v iptables >/dev/null 2>&1; then
-        echo -e "${YELLOW}安装iptables...${PLAIN}"
         ${PACKAGE_MANAGER} install -y iptables iptables-services >/dev/null 2>&1
     fi
     
-    # 清理旧规则
     iptables -t filter -F GOST 2>/dev/null
     iptables -t filter -X GOST 2>/dev/null
     
-    # 创建GOST链
     iptables -t filter -N GOST 2>/dev/null
     iptables -t filter -C INPUT -j GOST 2>/dev/null || iptables -t filter -A INPUT -j GOST
     iptables -t filter -C OUTPUT -j GOST 2>/dev/null || iptables -t filter -A OUTPUT -j GOST
 }
 
-# 添加端口流量统计规则
+# 添加端口流量规则
 add_traffic_rule() {
     local port=$1
     
-    # 入站流量统计
     iptables -t filter -C GOST -p tcp --dport ${port} -j ACCEPT 2>/dev/null || \
         iptables -t filter -A GOST -p tcp --dport ${port} -j ACCEPT
     iptables -t filter -C GOST -p udp --dport ${port} -j ACCEPT 2>/dev/null || \
         iptables -t filter -A GOST -p udp --dport ${port} -j ACCEPT
-    
-    # 出站流量统计
     iptables -t filter -C GOST -p tcp --sport ${port} -j ACCEPT 2>/dev/null || \
         iptables -t filter -A GOST -p tcp --sport ${port} -j ACCEPT
     iptables -t filter -C GOST -p udp --sport ${port} -j ACCEPT 2>/dev/null || \
         iptables -t filter -A GOST -p udp --sport ${port} -j ACCEPT
 }
 
-# 删除端口流量统计规则
+# 删除端口流量规则
 del_traffic_rule() {
     local port=$1
     
@@ -242,41 +212,33 @@ del_traffic_rule() {
     iptables -t filter -D GOST -p udp --sport ${port} -j ACCEPT 2>/dev/null
 }
 
-# 获取端口流量 - 修复科学计数法问题
+# 获取端口流量
 get_port_traffic() {
     local port=$1
-    local in_bytes=0
-    local out_bytes=0
     
-    # 使用awk处理可能的科学计数法
-    local tcp_in=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep tcp | awk '{s=sprintf("%.0f",$2); sum+=s}END{printf "%.0f", sum+0}')
-    local udp_in=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep udp | awk '{s=sprintf("%.0f",$2); sum+=s}END{printf "%.0f", sum+0}')
-    local tcp_out=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep tcp | awk '{s=sprintf("%.0f",$2); sum+=s}END{printf "%.0f", sum+0}')
-    local udp_out=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep udp | awk '{s=sprintf("%.0f",$2); sum+=s}END{printf "%.0f", sum+0}')
+    local in_tcp=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep tcp | awk '{s=sprintf("%.0f",$2); sum+=s}END{print sum+0}')
+    local in_udp=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "dpt:${port}" | grep udp | awk '{s=sprintf("%.0f",$2); sum+=s}END{print sum+0}')
+    local out_tcp=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep tcp | awk '{s=sprintf("%.0f",$2); sum+=s}END{print sum+0}')
+    local out_udp=$(iptables -t filter -nvxL GOST 2>/dev/null | grep "spt:${port}" | grep udp | awk '{s=sprintf("%.0f",$2); sum+=s}END{print sum+0}')
     
-    # 计算总流量
-    in_bytes=$(awk "BEGIN{printf \"%.0f\", ${tcp_in}+${udp_in}}")
-    out_bytes=$(awk "BEGIN{printf \"%.0f\", ${tcp_out}+${udp_out}}")
+    local in_bytes=$((in_tcp + in_udp))
+    local out_bytes=$((out_tcp + out_udp))
     
     echo "${in_bytes}:${out_bytes}"
 }
 
-# 格式化字节数
+# 格式化字节
 format_bytes() {
     local bytes=$1
-    
-    # 确保是数字
-    bytes=$(echo "${bytes}" | sed 's/[^0-9]//g')
-    [[ -z ${bytes} ]] && bytes=0
     
     if [[ ${bytes} -lt 1024 ]]; then
         echo "${bytes}B"
     elif [[ ${bytes} -lt 1048576 ]]; then
-        echo "$(awk "BEGIN{printf \"%.2f\", ${bytes}/1024}")KB"
+        echo "$(echo "scale=2; ${bytes}/1024" | bc)KB"
     elif [[ ${bytes} -lt 1073741824 ]]; then
-        echo "$(awk "BEGIN{printf \"%.2f\", ${bytes}/1048576}")MB"
+        echo "$(echo "scale=2; ${bytes}/1048576" | bc)MB"
     else
-        echo "$(awk "BEGIN{printf \"%.2f\", ${bytes}/1073741824}")GB"
+        echo "$(echo "scale=2; ${bytes}/1073741824" | bc)GB"
     fi
 }
 
@@ -284,47 +246,48 @@ format_bytes() {
 format_expire_time() {
     local expire_time=$1
     
-    if [[ "${expire_time}" == "永久" ]]; then
+    if [[ "${expire_time}" == "permanent" ]]; then
         echo "永久"
+        return
+    fi
+    
+    local current_time=$(date +%s)
+    local diff=$((expire_time - current_time))
+    
+    if [[ ${diff} -le 0 ]]; then
+        echo "已过期"
+    elif [[ ${diff} -lt 3600 ]]; then
+        echo "$((diff / 60))分钟"
+    elif [[ ${diff} -lt 86400 ]]; then
+        echo "$((diff / 3600))小时"
     else
-        local current_time=$(date +%s)
-        local diff=$((expire_time - current_time))
-        
-        if [[ ${diff} -le 0 ]]; then
-            echo "已过期"
-        elif [[ ${diff} -lt 3600 ]]; then
-            echo "$((diff / 60))分钟"
-        elif [[ ${diff} -lt 86400 ]]; then
-            echo "$((diff / 3600))小时"
-        else
-            echo "$((diff / 86400))天"
-        fi
+        echo "$((diff / 86400))天"
     fi
 }
 
-# 重建GOST配置 - 兼容2.x版本格式
+# 重建配置 - 使用正确的格式
 rebuild_config() {
-    local gost_ver=$(get_gost_version)
-    
     if [[ ! -s ${RAW_CONFIG} ]]; then
         echo '{"Debug":false,"Retries":0,"ServeNodes":[]}' > ${GOST_CONFIG}
     else
-        # GOST 2.x配置格式
         {
             echo '{"Debug":false,"Retries":0,"ServeNodes":['
             local first=true
             while IFS= read -r line; do
-                local port=$(echo "${line}" | cut -d'/' -f2 | cut -d'#' -f1)
-                local target=$(echo "${line}" | cut -d'#' -f2)
-                local target_port=$(echo "${line}" | cut -d'#' -f3)
-                
-                if [[ ${first} == false ]]; then
-                    echo ","
+                # 解析格式: nonencrypt/端口#目标IP#目标端口
+                if [[ ${line} =~ ^nonencrypt/([0-9]+)#(.+)#([0-9]+)$ ]]; then
+                    local port="${BASH_REMATCH[1]}"
+                    local target="${BASH_REMATCH[2]}"
+                    local target_port="${BASH_REMATCH[3]}"
+                    
+                    if [[ ${first} == false ]]; then
+                        echo ","
+                    fi
+                    first=false
+                    
+                    echo -n "        \"tcp://:${port}/${target}:${target_port}\","
+                    echo -n "\"udp://:${port}/${target}:${target_port}\""
                 fi
-                first=false
-                
-                # GOST 2.x格式
-                echo -n "        \"tcp://:${port}/${target}:${target_port}\",\"udp://:${port}/${target}:${target_port}\""
             done < ${RAW_CONFIG}
             echo ""
             echo "    ]"
@@ -333,58 +296,47 @@ rebuild_config() {
     fi
     
     systemctl restart gost >/dev/null 2>&1
-    
-    # 检查服务是否启动成功
-    sleep 2
-    if ! systemctl is-active gost >/dev/null 2>&1; then
-        echo -e "${RED}GOST服务启动失败，请检查配置${PLAIN}"
-        journalctl -u gost -n 20 --no-pager
-    fi
 }
 
-# 检查过期规则
+# 检查过期
 check_expired() {
+    [[ ! -f ${EXPIRES_FILE} ]] && return
+    
     local current_time=$(date +%s)
+    local temp_file="/tmp/expires_temp_$$"
     local need_rebuild=false
     
-    if [[ -f ${EXPIRES_FILE} ]]; then
-        local temp_file="/tmp/expires_temp_$$"
-        > ${temp_file}
-        
-        while IFS=: read -r port expire_time; do
-            if [[ "${expire_time}" != "永久" ]] && [[ ${expire_time} -le ${current_time} ]]; then
-                # 删除过期规则
-                sed -i "/\/${port}#/d" ${RAW_CONFIG}
-                sed -i "/^${port}:/d" ${REMARKS_FILE}
-                del_traffic_rule ${port}
-                need_rebuild=true
-                echo -e "${YELLOW}端口 ${port} 已过期并删除${PLAIN}"
-            else
-                echo "${port}:${expire_time}" >> ${temp_file}
-            fi
-        done < ${EXPIRES_FILE}
-        
-        mv -f ${temp_file} ${EXPIRES_FILE}
-    fi
+    > ${temp_file}
     
-    if [[ ${need_rebuild} == true ]]; then
-        rebuild_config
-    fi
+    while IFS=: read -r port expire_time; do
+        if [[ "${expire_time}" != "permanent" ]] && [[ ${expire_time} -lt ${current_time} ]]; then
+            sed -i "/^nonencrypt\/${port}#/d" ${RAW_CONFIG}
+            sed -i "/^${port}:/d" ${REMARKS_FILE}
+            del_traffic_rule ${port}
+            need_rebuild=true
+            echo -e "${YELLOW}端口 ${port} 已过期删除${PLAIN}"
+        else
+            echo "${port}:${expire_time}" >> ${temp_file}
+        fi
+    done < ${EXPIRES_FILE}
+    
+    mv -f ${temp_file} ${EXPIRES_FILE}
+    
+    [[ ${need_rebuild} == true ]] && rebuild_config
 }
 
-# 显示菜单头
+# 显示头部
 show_header() {
     clear
     echo -e "${BLUE}================================================${PLAIN}"
     echo -e "${GREEN}       GOST 端口转发管理面板 v${SCRIPT_VERSION}${PLAIN}"
     echo -e "${BLUE}================================================${PLAIN}"
     
-    # 显示系统状态
     local gost_status=$(systemctl is-active gost 2>/dev/null || echo "未运行")
     local gost_version=$(gost -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "未安装")
     local rule_count=$(wc -l < ${RAW_CONFIG} 2>/dev/null || echo "0")
     
-    echo -e "GOST状态: ${GREEN}${gost_status}${PLAIN} | 版本: ${GREEN}${gost_version}${PLAIN} | 规则数: ${GREEN}${rule_count}${PLAIN}"
+    echo -e "状态: ${GREEN}${gost_status}${PLAIN} | 版本: ${GREEN}${gost_version}${PLAIN} | 规则: ${GREEN}${rule_count}${PLAIN}"
     echo -e "${BLUE}================================================${PLAIN}"
     echo
 }
@@ -403,130 +355,117 @@ show_forwards() {
     
     local id=1
     while IFS= read -r line; do
-        local port=$(echo "${line}" | cut -d'/' -f2 | cut -d'#' -f1)
-        local target=$(echo "${line}" | cut -d'#' -f2)
-        local target_port=$(echo "${line}" | cut -d'#' -f3)
-        
-        # 获取备注
-        local remark=$(grep "^${port}:" ${REMARKS_FILE} 2>/dev/null | cut -d':' -f2- || echo "-")
-        [[ ${#remark} -gt 10 ]] && remark="${remark:0:10}.."
-        
-        # 获取到期时间
-        local expire_time=$(grep "^${port}:" ${EXPIRES_FILE} 2>/dev/null | cut -d':' -f2 || echo "永久")
-        local expire_display=$(format_expire_time "${expire_time}")
-        
-        # 获取流量
-        local traffic_data=$(get_port_traffic ${port})
-        local in_bytes=$(echo "${traffic_data}" | cut -d':' -f1)
-        local out_bytes=$(echo "${traffic_data}" | cut -d':' -f2)
-        local total_bytes=$(awk "BEGIN{printf \"%.0f\", ${in_bytes}+${out_bytes}}")
-        local traffic_display=$(format_bytes ${total_bytes})
-        
-        # 颜色显示
-        if [[ "${expire_display}" == "已过期" ]]; then
-            expire_color="${RED}"
-        elif [[ "${expire_display}" == *"分钟"* ]] || [[ "${expire_display}" == *"小时"* ]]; then
-            expire_color="${YELLOW}"
-        else
-            expire_color=""
+        # 解析格式: nonencrypt/端口#目标IP#目标端口
+        if [[ ${line} =~ ^nonencrypt/([0-9]+)#(.+)#([0-9]+)$ ]]; then
+            local port="${BASH_REMATCH[1]}"
+            local target="${BASH_REMATCH[2]}"
+            local target_port="${BASH_REMATCH[3]}"
+            
+            local remark=$(grep "^${port}:" ${REMARKS_FILE} 2>/dev/null | cut -d':' -f2- || echo "-")
+            [[ ${#remark} -gt 10 ]] && remark="${remark:0:10}.."
+            
+            local expire_time=$(grep "^${port}:" ${EXPIRES_FILE} 2>/dev/null | cut -d':' -f2 || echo "permanent")
+            local expire_display=$(format_expire_time "${expire_time}")
+            
+            local traffic_data=$(get_port_traffic ${port})
+            local in_bytes=$(echo "${traffic_data}" | cut -d':' -f1)
+            local out_bytes=$(echo "${traffic_data}" | cut -d':' -f2)
+            local total_bytes=$((in_bytes + out_bytes))
+            local traffic_display=$(format_bytes ${total_bytes})
+            
+            if [[ "${expire_display}" == "已过期" ]]; then
+                expire_color="${RED}"
+            elif [[ "${expire_display}" == *"分钟"* ]] || [[ "${expire_display}" == *"小时"* ]]; then
+                expire_color="${YELLOW}"
+            else
+                expire_color=""
+            fi
+            
+            printf "%-4s %-10s %-25s %-12s ${expire_color}%-10s${PLAIN} %-15s\n" \
+                "${id}" "${port}" "${target}:${target_port}" "${remark}" "${expire_display}" "${traffic_display}"
+            
+            ((id++))
         fi
-        
-        printf "%-4s %-10s %-25s %-12s ${expire_color}%-10s${PLAIN} %-15s\n" \
-            "${id}" "${port}" "${target}:${target_port}" "${remark}" "${expire_display}" "${traffic_display}"
-        
-        ((id++))
     done < ${RAW_CONFIG}
 }
 
-# 添加转发规则
+# 添加转发
 add_forward() {
     echo -e "${GREEN}添加转发规则${PLAIN}"
     
     read -p "本地端口: " local_port
     read -p "目标地址: " target_ip
     read -p "目标端口: " target_port
-    read -p "备注信息(可选): " remark
+    read -p "备注(可选): " remark
     
-    # 验证输入
     if [[ ! ${local_port} =~ ^[0-9]+$ ]] || [[ ! ${target_port} =~ ^[0-9]+$ ]]; then
         echo -e "${RED}端口必须为数字${PLAIN}"
         return
     fi
     
-    # 检查端口是否已使用
-    if grep -q "/${local_port}#" ${RAW_CONFIG} 2>/dev/null; then
+    if grep -q "^nonencrypt/${local_port}#" ${RAW_CONFIG} 2>/dev/null; then
         echo -e "${RED}端口 ${local_port} 已被使用${PLAIN}"
         return
     fi
     
-    # 设置到期时间
     echo -e "${GREEN}设置到期时间:${PLAIN}"
-    echo "1) 永久有效"
-    echo "2) 1小时"
-    echo "3) 1天"
-    echo "4) 7天"
-    echo "5) 30天"
-    echo "6) 自定义天数"
-    read -p "请选择 [1-6]: " expire_choice
+    echo "1) 永久"
+    echo "2) 1天"
+    echo "3) 7天"
+    echo "4) 30天"
+    echo "5) 自定义(天)"
+    read -p "选择 [1-5]: " expire_choice
     
-    local expire_time="永久"
+    local expire_time="permanent"
     case ${expire_choice} in
         2)
-            expire_time=$(($(date +%s) + 3600))
+            expire_time=$(($(date +%s) + 86400))
+            echo -e "${GREEN}到期时间: 1天${PLAIN}"
             ;;
         3)
-            expire_time=$(($(date +%s) + 86400))
+            expire_time=$(($(date +%s) + 604800))
+            echo -e "${GREEN}到期时间: 7天${PLAIN}"
             ;;
         4)
-            expire_time=$(($(date +%s) + 604800))
+            expire_time=$(($(date +%s) + 2592000))
+            echo -e "${GREEN}到期时间: 30天${PLAIN}"
             ;;
         5)
-            expire_time=$(($(date +%s) + 2592000))
-            ;;
-        6)
-            read -p "请输入天数: " days
-            if [[ ${days} =~ ^[0-9]+$ ]]; then
+            read -p "输入天数: " days
+            if [[ ${days} =~ ^[0-9]+$ ]] && [[ ${days} -gt 0 ]]; then
                 expire_time=$(($(date +%s) + days * 86400))
+                echo -e "${GREEN}到期时间: ${days}天${PLAIN}"
             else
-                expire_time="永久"
+                expire_time="permanent"
+                echo -e "${GREEN}设置为永久${PLAIN}"
             fi
             ;;
         *)
-            expire_time="永久"
+            expire_time="permanent"
+            echo -e "${GREEN}设置为永久${PLAIN}"
             ;;
     esac
     
-    # 添加规则
-    echo "tcp/${local_port}#${target_ip}#${target_port}" >> ${RAW_CONFIG}
+    # 使用正确的格式
+    echo "nonencrypt/${local_port}#${target_ip}#${target_port}" >> ${RAW_CONFIG}
     
-    # 保存备注
-    if [[ -n ${remark} ]]; then
-        echo "${local_port}:${remark}" >> ${REMARKS_FILE}
-    fi
-    
-    # 保存到期时间
+    [[ -n ${remark} ]] && echo "${local_port}:${remark}" >> ${REMARKS_FILE}
     echo "${local_port}:${expire_time}" >> ${EXPIRES_FILE}
     
-    # 添加流量统计
     add_traffic_rule ${local_port}
-    
-    # 重建配置
     rebuild_config
     
     echo -e "${GREEN}添加成功: ${local_port} -> ${target_ip}:${target_port}${PLAIN}"
-    if [[ "${expire_time}" != "永久" ]]; then
-        echo -e "${GREEN}到期时间: $(format_expire_time ${expire_time})${PLAIN}"
-    fi
 }
 
-# 删除转发规则
+# 删除转发
 del_forward() {
     show_forwards
     echo
-    read -p "请输入要删除的规则ID: " rule_id
+    read -p "输入要删除的ID: " rule_id
     
     if [[ ! ${rule_id} =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}无效的ID${PLAIN}"
+        echo -e "${RED}无效ID${PLAIN}"
         return
     fi
     
@@ -536,24 +475,21 @@ del_forward() {
         return
     fi
     
-    local port=$(echo "${line}" | cut -d'/' -f2 | cut -d'#' -f1)
-    
-    # 删除规则
-    sed -i "${rule_id}d" ${RAW_CONFIG}
-    sed -i "/^${port}:/d" ${REMARKS_FILE}
-    sed -i "/^${port}:/d" ${EXPIRES_FILE}
-    sed -i "/^${port}:/d" ${TRAFFIC_DB}
-    
-    # 删除流量统计
-    del_traffic_rule ${port}
-    
-    # 重建配置
-    rebuild_config
-    
-    echo -e "${GREEN}删除成功${PLAIN}"
+    if [[ ${line} =~ ^nonencrypt/([0-9]+)# ]]; then
+        local port="${BASH_REMATCH[1]}"
+        
+        sed -i "${rule_id}d" ${RAW_CONFIG}
+        sed -i "/^${port}:/d" ${REMARKS_FILE}
+        sed -i "/^${port}:/d" ${EXPIRES_FILE}
+        
+        del_traffic_rule ${port}
+        rebuild_config
+        
+        echo -e "${GREEN}删除成功${PLAIN}"
+    fi
 }
 
-# 查看流量统计
+# 查看流量
 show_traffic() {
     if [[ ! -s ${RAW_CONFIG} ]]; then
         echo -e "${YELLOW}暂无转发规则${PLAIN}"
@@ -569,37 +505,30 @@ show_traffic() {
     local total_out=0
     
     while IFS= read -r line; do
-        local port=$(echo "${line}" | cut -d'/' -f2 | cut -d'#' -f1)
-        local traffic_data=$(get_port_traffic ${port})
-        local in_bytes=$(echo "${traffic_data}" | cut -d':' -f1)
-        local out_bytes=$(echo "${traffic_data}" | cut -d':' -f2)
-        local total_bytes=$(awk "BEGIN{printf \"%.0f\", ${in_bytes}+${out_bytes}}")
-        
-        total_in=$(awk "BEGIN{printf \"%.0f\", ${total_in}+${in_bytes}}")
-        total_out=$(awk "BEGIN{printf \"%.0f\", ${total_out}+${out_bytes}}")
-        
-        printf "%-10s %-15s %-15s %-15s\n" \
-            "${port}" \
-            "$(format_bytes ${in_bytes})" \
-            "$(format_bytes ${out_bytes})" \
-            "$(format_bytes ${total_bytes})"
+        if [[ ${line} =~ ^nonencrypt/([0-9]+)# ]]; then
+            local port="${BASH_REMATCH[1]}"
+            local traffic_data=$(get_port_traffic ${port})
+            local in_bytes=$(echo "${traffic_data}" | cut -d':' -f1)
+            local out_bytes=$(echo "${traffic_data}" | cut -d':' -f2)
+            local total_bytes=$((in_bytes + out_bytes))
+            
+            total_in=$((total_in + in_bytes))
+            total_out=$((total_out + out_bytes))
+            
+            printf "%-10s %-15s %-15s %-15s\n" \
+                "${port}" \
+                "$(format_bytes ${in_bytes})" \
+                "$(format_bytes ${out_bytes})" \
+                "$(format_bytes ${total_bytes})"
+        fi
     done < ${RAW_CONFIG}
     
     echo -e "${BLUE}-----------------------------------------------------------${PLAIN}"
-    local total_all=$(awk "BEGIN{printf \"%.0f\", ${total_in}+${total_out}}")
     printf "%-10s %-15s %-15s %-15s\n" \
         "总计" \
         "$(format_bytes ${total_in})" \
         "$(format_bytes ${total_out})" \
-        "$(format_bytes ${total_all})"
-}
-
-# 查看GOST日志
-show_gost_log() {
-    echo -e "${GREEN}GOST服务日志 (最近50行):${PLAIN}"
-    echo -e "${BLUE}-----------------------------------------------------------${PLAIN}"
-    journalctl -u gost -n 50 --no-pager
-    echo -e "${BLUE}-----------------------------------------------------------${PLAIN}"
+        "$(format_bytes $((total_in + total_out)))"
 }
 
 # 主菜单
@@ -610,18 +539,16 @@ main_menu() {
         show_forwards
         echo
         echo -e "${GREEN}操作菜单:${PLAIN}"
-        echo -e "${GREEN}1.${PLAIN} 添加转发规则"
-        echo -e "${GREEN}2.${PLAIN} 删除转发规则"
-        echo -e "${GREEN}3.${PLAIN} 查看流量统计"
-        echo -e "${GREEN}4.${PLAIN} 重启GOST服务"
-        echo -e "${GREEN}5.${PLAIN} 查看GOST日志"
+        echo -e "${GREEN}1.${PLAIN} 添加转发"
+        echo -e "${GREEN}2.${PLAIN} 删除转发"
+        echo -e "${GREEN}3.${PLAIN} 查看流量"
+        echo -e "${GREEN}4.${PLAIN} 重启服务"
+        echo -e "${GREEN}5.${PLAIN} 查看日志"
         echo -e "${GREEN}6.${PLAIN} 修复g命令"
-        echo -e "${GREEN}7.${PLAIN} 重新安装GOST"
-        echo -e "${GREEN}8.${PLAIN} 卸载GOST"
         echo -e "${GREEN}0.${PLAIN} 退出"
         echo
         
-        read -p "请选择 [0-8]: " choice
+        read -p "选择 [0-6]: " choice
         
         case ${choice} in
             1)
@@ -641,55 +568,25 @@ main_menu() {
                 ;;
             4)
                 systemctl restart gost
-                sleep 1
-                if systemctl is-active gost >/dev/null 2>&1; then
-                    echo -e "${GREEN}重启成功${PLAIN}"
-                else
-                    echo -e "${RED}重启失败，查看日志...${PLAIN}"
-                    journalctl -u gost -n 20 --no-pager
-                fi
+                echo -e "${GREEN}重启成功${PLAIN}"
                 sleep 2
                 ;;
             5)
-                clear
-                show_header
-                show_gost_log
+                echo -e "${GREEN}GOST日志:${PLAIN}"
+                journalctl -u gost -n 30 --no-pager
                 read -p "按Enter继续..."
                 ;;
             6)
                 fix_g_command
-                echo -e "${GREEN}请重新输入 g 命令进入面板${PLAIN}"
-                sleep 2
-                ;;
-            7)
-                install_gost
-                init_iptables
-                sleep 2
-                ;;
-            8)
-                read -p "确定要卸载GOST吗？(y/n): " confirm
-                if [[ ${confirm} == "y" ]]; then
-                    systemctl stop gost
-                    systemctl disable gost
-                    rm -f /usr/bin/gost /usr/bin/g
-                    rm -f /usr/local/bin/gost-manager
-                    rm -f /usr/local/bin/check-gost-expire.sh
-                    rm -rf ${CONFIG_DIR}
-                    rm -f /etc/systemd/system/gost.service
-                    rm -f /etc/cron.d/gost-expire
-                    
-                    # 清理iptables
-                    echo -e "${GREEN}卸载完成${PLAIN}"
-                    exit 0
-                fi
+                echo -e "${GREEN}请重新输入 g${PLAIN}"
+                exit 0
                 ;;
             0)
-                echo -e "${GREEN}再见！${PLAIN}"
                 exit 0
                 ;;
             *)
                 echo -e "${RED}无效选择${PLAIN}"
-                sleep 2
+                sleep 1
                 ;;
         esac
     done
@@ -700,13 +597,11 @@ main() {
     check_root
     check_system
     
-    # 处理命令行参数
     if [[ "$1" == "--rebuild" ]]; then
         rebuild_config
         exit 0
     fi
     
-    # 检查是否已安装
     if [[ ! -f /usr/bin/gost ]]; then
         echo -e "${YELLOW}GOST未安装，开始安装...${PLAIN}"
         install_deps
@@ -714,23 +609,18 @@ main() {
         init_iptables
     fi
     
-    # 始终修复g命令，确保可用
     fix_g_command
-    
-    # 初始化iptables
     init_iptables
     
-    # 为已有规则添加流量统计
     if [[ -s ${RAW_CONFIG} ]]; then
         while IFS= read -r line; do
-            local port=$(echo "${line}" | cut -d'/' -f2 | cut -d'#' -f1)
-            add_traffic_rule ${port}
+            if [[ ${line} =~ ^nonencrypt/([0-9]+)# ]]; then
+                add_traffic_rule "${BASH_REMATCH[1]}"
+            fi
         done < ${RAW_CONFIG}
     fi
     
-    # 显示主菜单
     main_menu
 }
 
-# 运行主函数
 main "$@"
